@@ -192,6 +192,125 @@ There are a few caveats worth knowing:
   {% include api i="interface.Stream.play_url" %})
 * Only a basic check is made, the file might be broken and not still not playable
 
+## Stereo Pairs
+
+Two speakers that form a stereo pair (e.g. two HomePods) are two independent
+receivers: each one has to be streamed to on its own. To play to both halves as
+one room, set `protocols.raop.pair_buddy_address` in the settings to the address
+of the *other* half and stream to the first half as usual:
+
+```python
+settings = await storage.get_settings(conf)
+settings.protocols.raop.pair_buddy_address = "10.0.0.20"
+
+atv = await connect(conf, loop, storage=storage)
+await atv.stream.stream_file("sample.mp3")
+```
+
+A port can be included if the other half does not use the same port as the device
+being connected to, e.g. `10.0.0.20:7000`. The same can be set with `atvremote`:
+
+```shell
+atvremote -s 10.0.0.10 --id <identifier> \
+    change_setting=protocols.raop.pair_buddy_address,10.0.0.20 stream_file=sample.mp3
+```
+
+Both halves are then set up as one playback group and fed the same audio from one
+timeline, anchored at the same point in time and kept in sync by one (NTP) timing
+server. They do play in sync: this has been verified by ear on a pair of HomePods
+running audioOS 27, over a 30 second and a five minute run, with both halves
+taking their time from the one timing server (32 requests answered between them
+over the 30 second run). That is a listener's verdict over those durations, not a
+measurement of drift.
+
+A few things are worth knowing:
+
+* The address is static: it is not discovered, so a device that gets a new address
+  from DHCP silently breaks the setup.
+* Volume is a property of the pair, so both halves are set to the same volume and
+  a pair reports one volume level for both halves.
+* Streaming twice in rapid succession can fail: a pair goes through a transitional
+  state for a few seconds after a session is torn down, where it may refuse to set
+  up a new session. Waiting about 15 seconds between streams avoids that.
+* More than two receivers is not supported: only one buddy can be configured, and
+  nothing beyond a stereo pair has been verified.
+* The halves stay a stereo pair while pyatv streams to them, and render their own
+  left and right channels ([below](#the-pair-stays-a-pair)).
+
+### The pair stays a pair
+
+While pyatv streams to both halves, they remain a stereo pair. Both halves join
+the group pyatv names, and the pair splits the channels itself: the left channel
+comes out of one speaker and the right channel out of the other, from an ordinary
+stereo file. pyatv sends the same full mix to each half and does nothing
+channel-related — the speakers do the rest.
+
+What splits a pair is a session that names no group, not the timing protocol: a
+sender whose session sends no `groupUUID` leaves each half in a group of its own,
+rendering the whole mix. pyatv sends one whenever `pair_buddy_address` is set.
+
+#### Group state, read off the network
+
+Group membership is announced in cleartext in the mDNS TXT record, where `gid` is
+the group UUID, `igl` is "is group leader" and `gcgl` is "group contains group
+leader" (they are listed with the other properties in the
+[protocol documentation](/documentation/protocols/)). Watched on a bonded pair of
+HomePods running audioOS 27, with samples taken through live sessions:
+
+| State of the pair | One half | The other half |
+| ----------------- | -------- | -------------- |
+| Bonded, nothing playing | `igl=1 gcgl=1`, shared `gid` | `igl=0 gcgl=1`, the same `gid` |
+| Streamed to by pyatv, `pair_buddy_address` set (NTP) | `igl=0 gcgl=0`, pyatv's `gid` | `igl=0 gcgl=0`, the same `gid` |
+| Streamed to over a shared PTP timeline | `igl=0 gcgl=0`, the sender's `gid` | `igl=0 gcgl=0`, the same `gid` |
+| Streamed to by a session that names no group | `igl=1`, a `gid` of its own | `igl=1`, a different `gid` |
+
+The middle two rows are the same signature, and it is the one an Apple sender
+produces: both halves are members of the sender's group and neither claims to lead
+it. The clock makes no difference to it. The pair travels together and splits the
+channels itself.
+
+The bottom row is what a session without a `groupUUID` does; it was measured with
+another sender, driven both ways on the same pair, not with pyatv. pyatv sends a
+`groupUUID` whenever `pair_buddy_address` is set, together with
+`senderSupportsRelay: true`, without which a receiver ignores the group.
+
+The TXT record is also how you can check it on your own pair, with `dns-sd -L` or
+any other mDNS browser, while a stream is running.
+
+#### The stereo image, by ear
+
+Group membership is not the same thing as what comes out of the speakers, so the
+image was checked by listening. The test file had a continuous low drone on the
+left channel and a short high beep once a second on the right; it was streamed to
+both halves with nothing done sender-side. The listener heard the beep from one
+speaker only, and the drone from both positions — which is what a 150 Hz tone does
+in a room rather than a sign of crosstalk, since low frequencies are close to
+omnidirectional and a 1600 Hz beep localises cleanly. That is why the discriminating
+tone was the high one. The same verdict was reached through this branch over NTP
+and through another project's sender over PTP.
+
+What that rests on: one stereo pair, one listener, one day of runs. The sync
+verdict is a listener's verdict too, over a 30 second and a five minute run. Neither
+is a measurement of drift or of channel separation.
+
+#### NTP is enough for this
+
+pyatv implements NTP timing only, and for stereo pairs that turns out not to cost
+anything: the group forms with the same signature as under PTP, and the pair renders
+its own image either way. PTP would still be a large change if it were ever wanted
+for something else — a full IEEE 1588 clock on UDP ports 319 and 320, which are
+privileged, and which on macOS are held by the host's own AirPlay stack while it is
+streaming. A sender-side split, sending left only to one half and right only to the
+other, is not needed for a bonded pair; pyatv does not do it.
+
+#### Speaker names do not tell you which channel a half renders
+
+On the pair used here, the half whose name ends in "Left" renders the **right**
+channel. Names are assigned by whoever set the speakers up, and nothing observed on
+the network — TXT record or session response — advertises the role. Do not infer it
+from a name, in your own code or when setting `pair_buddy_address`: which half is
+which does not affect grouping, and the only way to find out is to listen.
+
 ## Password
 
 If you stream audio using the RAOP protocol and the device requires a password, you can set the password like this: 

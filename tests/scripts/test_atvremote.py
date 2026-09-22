@@ -138,7 +138,11 @@ async def test_settings(scriptenv):
     stdout, _, exit_code = await scriptenv(
         "atvremote", "--id", MRP_ID, "print_settings", persistent_storage=True
     )
-    assert all_in(stdout, "protocols.raop.password = None")
+    assert all_in(
+        stdout,
+        "protocols.raop.password = None",
+        "protocols.raop.pair_buddy_address = None",
+    )
     assert exit_code == 0
 
     # Change value of protocols.raop.password

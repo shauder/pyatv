@@ -1,6 +1,7 @@
 """Unit tests for pyatv.protocols.raop."""
 
 from ipaddress import ip_address
+from types import SimpleNamespace
 
 from deepdiff import DeepDiff
 import pytest
@@ -9,6 +10,8 @@ from pyatv.const import DeviceModel, OperatingSystem, PairingRequirement, Protoc
 from pyatv.core import MutableService, mdns
 from pyatv.interface import DeviceInfo
 from pyatv.protocols.raop import device_info, scan, service_info
+from pyatv.protocols.raop.protocols import StreamContext, StreamMember
+from pyatv.protocols.raop.stream_client import ControlClient
 
 RAOP_SERVICE = "_raop._tcp.local"
 AIRPORT_SERVICE = "_airport._tcp.local"
@@ -172,3 +175,45 @@ async def test_service_info_pairing_acl(props, pairing_req):
     )
 
     assert raop_service.pairing == pairing_req
+
+
+def _member(remote_ip: str, control_port: int) -> StreamMember:
+    """A member carrying only the two fields retransmit attribution looks at."""
+    rtsp = SimpleNamespace(connection=SimpleNamespace(remote_ip=remote_ip))
+    member = StreamMember(rtsp)
+    member.control_port = control_port
+    return member
+
+
+@pytest.mark.parametrize(
+    "addr, expected",
+    [
+        # Both halves picked the same ephemeral control port, which two identical
+        # speakers booted together can do. The address is what tells them apart,
+        # and a request must be served from the backlog of the receiver that sent
+        # it: packets are encrypted per receiver, so the other half's copy cannot
+        # be decrypted by the one asking for it and the gap is never repaired.
+        (("10.0.0.21", 7011), 1),
+        (("10.0.0.20", 7011), 0),
+        # A receiver answering from a port other than the one it named is still
+        # identified by its address.
+        (("10.0.0.21", 54321), 1),
+        (("10.0.0.99", 7011), None),
+    ],
+)
+def test_retransmit_attributed_by_address_not_port(addr, expected):
+    members = [_member("10.0.0.20", 7011), _member("10.0.0.21", 7011)]
+    control = ControlClient(StreamContext(), members)
+
+    found = control._find_member(addr)  # pylint: disable=protected-access
+
+    assert found is (None if expected is None else members[expected])
+
+
+def test_retransmit_attribution_tells_loopback_members_apart():
+    """The fake devices all live on 127.0.0.1 and differ only by port."""
+    members = [_member("127.0.0.1", 50001), _member("127.0.0.1", 50002)]
+    control = ControlClient(StreamContext(), members)
+
+    assert control._find_member(("127.0.0.1", 50002)) is members[1]
+    assert control._find_member(("127.0.0.1", 50001)) is members[0]

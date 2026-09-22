@@ -161,6 +161,15 @@ class RaopSettings(BaseModel, extra="ignore"):  # type: ignore[call-arg]
     Set to 0 to use random free port.
     """
 
+    pair_buddy_address: Optional[str] = None
+    """Address of the second half of a stereo pair.
+
+    Set this to stream to both halves of a stereo pair (e.g. two HomePods) as one
+    room, playing in sync from one timeline. Specify either just an address, e.g.
+    "10.0.0.20", or an address and a port, e.g. "10.0.0.20:7000". The port used by
+    this device is used when no port is specified.
+    """
+
 
 class ProtocolSettings(BaseModel, extra="ignore"):  # type: ignore[call-arg]
     """Container for protocol specific settings."""

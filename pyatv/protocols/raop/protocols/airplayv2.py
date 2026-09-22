@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import plistlib
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 from uuid import uuid4
 
 from pyatv import exceptions
@@ -33,14 +33,51 @@ HEADERS = {
 }
 
 
+def session_setup_body(
+    timing_server_port: int, group_uuid: Optional[str] = None
+) -> Dict[str, Any]:
+    """Return body used for the session SETUP request.
+
+    Passing a group UUID sets up a *grouped* session, i.e. a session where
+    several receivers play the same audio as one room. All members of the group
+    must be given the same UUID.
+
+    A receiver only joins the group if "senderSupportsRelay" is True: with False
+    (the value used for an ungrouped session, and what pyatv has always sent) the
+    receiver ignores the group and plays as a group of its own.
+    "groupContainsGroupLeader" is False either way, as we are a sender and not a
+    receiver that others can be told to follow.
+    """
+    body: Dict[str, Any] = {
+        "deviceID": "AA:BB:CC:DD:EE:FF",
+        "sessionUUID": str(uuid4()).upper(),
+        "timingPort": timing_server_port,
+        "timingProtocol": "NTP",
+        "isMultiSelectAirPlay": True,
+        "groupContainsGroupLeader": False,
+        "macAddress": "AA:BB:CC:DD:EE:FF",
+        "model": "iPhone14,3",
+        "name": "pyatv",
+        "osBuildVersion": "20F66",
+        "osName": "iPhone OS",
+        "osVersion": "16.5",
+        "senderSupportsRelay": group_uuid is not None,
+        "sourceVersion": "690.7.1",
+        "statsCollectionEnabled": False,
+    }
+
+    if group_uuid is not None:
+        body["groupUUID"] = group_uuid
+
+    return body
+
+
 class AirPlayV2(StreamProtocol):
     """Stream protocol used for AirPlay v1 support."""
 
     def __init__(self, context: StreamContext, rtsp: RtspSession) -> None:
         """Initialize a new AirPlayV2 instance."""
-        super().__init__()
-        self.context = context
-        self.rtsp = rtsp
+        super().__init__(context, rtsp)
         self.event_channel: Optional[asyncio.BaseTransport] = None
         self._verifier: Optional[PairVerifyProcedure] = None
         self._cipher: Optional[Chacha20Cipher] = None
@@ -54,23 +91,7 @@ class AirPlayV2(StreamProtocol):
         )
 
         setup_resp = await self.rtsp.setup(
-            body={
-                "deviceID": "AA:BB:CC:DD:EE:FF",
-                "sessionUUID": str(uuid4()).upper(),
-                "timingPort": timing_server_port,
-                "timingProtocol": "NTP",
-                "isMultiSelectAirPlay": True,
-                "groupContainsGroupLeader": False,
-                "macAddress": "AA:BB:CC:DD:EE:FF",
-                "model": "iPhone14,3",
-                "name": "pyatv",
-                "osBuildVersion": "20F66",
-                "osName": "iPhone OS",
-                "osVersion": "16.5",
-                "senderSupportsRelay": False,
-                "sourceVersion": "690.7.1",
-                "statsCollectionEnabled": False,
-            }
+            body=session_setup_body(timing_server_port, self.context.group_uuid)
         )
         resp = decode_bplist_from_body(setup_resp)
         _LOGGER.debug("Setup response body: %s", resp)
@@ -140,7 +161,7 @@ class AirPlayV2(StreamProtocol):
                         "sr": 44100,  # Sample rate
                         "type": 0x60,
                         "supportsDynamicStreamID": False,
-                        "streamConnectionID": self.rtsp.session_id,
+                        "streamConnectionID": self.context.ssrc,
                     }
                 ]
             }
@@ -150,8 +171,8 @@ class AirPlayV2(StreamProtocol):
 
         stream = resp["streams"][0]
 
-        self.context.control_port = stream["controlPort"]
-        self.context.server_port = stream["dataPort"]
+        self.member.control_port = stream["controlPort"]
+        self.member.server_port = stream["dataPort"]
 
         self._cipher = Chacha20Cipher8byteNonce(shared_secret, shared_secret)
 

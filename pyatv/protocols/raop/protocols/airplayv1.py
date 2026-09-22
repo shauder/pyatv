@@ -39,9 +39,7 @@ class AirPlayV1(StreamProtocol):
 
     def __init__(self, context: StreamContext, rtsp: RtspSession) -> None:
         """Initialize a new AirPlayV1 instance."""
-        super().__init__()
-        self.context = context
-        self.rtsp = rtsp
+        super().__init__(context, rtsp)
         self._keep_alive_task: Optional[asyncio.Future] = None
 
     async def setup(self, timing_server_port: int, control_client_port: int) -> None:
@@ -66,16 +64,16 @@ class AirPlayV1(StreamProtocol):
             }
         )
         _, options = parse_transport(resp.headers["Transport"])
-        self.context.timing_port = int(options.get("timing_port", 0))
-        self.context.control_port = int(options["control_port"])
-        self.context.rtsp_session = int(resp.headers["Session"])
-        self.context.server_port = int(options["server_port"])
+        self.member.timing_port = int(options.get("timing_port", 0))
+        self.member.control_port = int(options["control_port"])
+        self.member.rtsp_session = int(resp.headers["Session"])
+        self.member.server_port = int(options["server_port"])
 
         _LOGGER.debug(
             "Remote ports: control=%d, timing=%d, server=%d",
-            self.context.control_port,
-            self.context.timing_port,
-            self.context.server_port,
+            self.member.control_port,
+            self.member.timing_port,
+            self.member.server_port,
         )
 
     def teardown(self) -> None:

@@ -3,9 +3,22 @@
 import asyncio
 import io
 import logging
-from typing import Any, Dict, Generator, Mapping, Optional, Set, Tuple, Union, cast
+from typing import (
+    Any,
+    Dict,
+    Generator,
+    List,
+    Mapping,
+    Optional,
+    Set,
+    Tuple,
+    Type,
+    Union,
+    cast,
+)
 
 from pyatv import const, exceptions
+from pyatv.auth.hap_pairing import NO_CREDENTIALS, TRANSIENT_CREDENTIALS
 from pyatv.const import (
     DeviceModel,
     FeatureName,
@@ -54,7 +67,13 @@ from pyatv.protocols.airplay.utils import (
     update_service_details,
 )
 from pyatv.protocols.raop.audio_source import AudioSource, open_source
-from pyatv.protocols.raop.protocols import StreamContext, airplayv1, airplayv2
+from pyatv.protocols.raop.protocols import (
+    StreamContext,
+    StreamProtocol,
+    airplayv1,
+    airplayv2,
+    new_group_uuid,
+)
 from pyatv.protocols.raop.stream_client import PlaybackInfo, RaopListener, StreamClient
 from pyatv.support.collections import dict_merge
 from pyatv.support.device_info import lookup_model, lookup_os
@@ -105,6 +124,12 @@ class RaopPushUpdater(AbstractPushUpdater):
             _LOGGER.debug("Playstatus error occurred: %s", ex)
 
 
+def _parse_buddy_address(address: str, default_port: int) -> Tuple[str, int]:
+    """Split an "address" or "address:port" setting into address and port."""
+    host, _, port = address.partition(":")
+    return host.strip(), int(port) if port else default_port
+
+
 class RaopPlaybackManager:
     """Manage current play state for RAOP."""
 
@@ -114,8 +139,7 @@ class RaopPlaybackManager:
         self.playback_info: Optional[PlaybackInfo] = None
         self._is_acquired: bool = False
         self._context: StreamContext = StreamContext()
-        self._connection: Optional[HttpConnection] = None
-        self._rtsp: Optional[RtspSession] = None
+        self._connections: List[HttpConnection] = []
         self._stream_client: Optional[StreamClient] = None
 
     @property
@@ -137,13 +161,8 @@ class RaopPlaybackManager:
 
     async def setup(self, service: BaseService) -> Tuple[StreamClient, StreamContext]:
         """Set up a session or return active if it exists."""
-        if self._stream_client and self._rtsp and self._context:
+        if self._stream_client:
             return self._stream_client, self._context
-
-        self._connection = await http_connect(
-            str(self.core.config.address), self.core.service.port
-        )
-        self._rtsp = RtspSession(self._connection)
 
         protocol_version = get_protocol_version(
             service, self.core.settings.protocols.raop.protocol_version
@@ -156,25 +175,64 @@ class RaopPlaybackManager:
             else airplayv2.AirPlayV2
         )
 
-        self._stream_client = StreamClient(
-            self._rtsp,
-            self._context,
-            protocol_class(self._context, self._rtsp),
-            self.core.settings,
-        )
+        protocols = [
+            await self._connect(
+                str(self.core.config.address), self.core.service.port, protocol_class
+            )
+        ]
+
+        # A stereo pair is streamed to as two receivers playing from one timeline,
+        # so connect to the other half as well when configured
+        buddy_address = self.core.settings.protocols.raop.pair_buddy_address
+        if buddy_address:
+            # Credentials live on the shared StreamContext, so both halves would
+            # authenticate with the primary's HAP long-term keys. That works for
+            # transient pairing, which carries no per-device state, but stored
+            # credentials are bound to the primary's pairing record and the buddy
+            # has no such pairing: it would reject the verify. There is nowhere
+            # to put the buddy's own credentials yet (pair_buddy_address is a
+            # bare address), so say that instead of failing mid-handshake.
+            credentials = extract_credentials(self.core.service)
+            if credentials not in (NO_CREDENTIALS, TRANSIENT_CREDENTIALS):
+                raise exceptions.NotSupportedError(
+                    "pair_buddy_address cannot be used with stored credentials: "
+                    "the buddy would be verified with the primary's pairing"
+                )
+
+            address, port = _parse_buddy_address(buddy_address, self.core.service.port)
+            _LOGGER.debug("Streaming to stereo pair buddy at %s:%d", address, port)
+            protocols.append(await self._connect(address, port, protocol_class))
+
+        # The SSRC identifies the audio stream and is shared by everyone receiving it
+        self._context.ssrc = protocols[0].rtsp.session_id
+
+        # Receivers belonging to the same playback group are told so by a group
+        # identifier that all members share. It is randomly generated (and thus a
+        # version 4 UUID) once per group: a version 5 UUID would claim to be a
+        # group the receivers formed themselves. Only set when grouping, as it
+        # changes how a receiver treats the session.
+        self._context.group_uuid = new_group_uuid() if len(protocols) > 1 else None
+
+        self._stream_client = StreamClient(self._context, protocols, self.core.settings)
         return self._stream_client, self._context
+
+    async def _connect(
+        self, address: str, port: int, protocol_class: Type[StreamProtocol]
+    ) -> StreamProtocol:
+        """Connect to one receiver and return a protocol instance for it."""
+        connection = await http_connect(address, port)
+        self._connections.append(connection)
+        return protocol_class(self._context, RtspSession(connection))
 
     async def teardown(self) -> None:
         """Tear down and disconnect current session."""
         if self._stream_client:
             self._stream_client.close()
-        if self._connection:
-            self._connection.close()
-            self._connection = None
+        for connection in self._connections:
+            connection.close()
+        self._connections = []
         self._stream_client = None
         self._context.reset()
-        self._rtsp = None
-        self._connection = None
         self._is_acquired = False
 
 

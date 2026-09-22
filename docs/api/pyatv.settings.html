@@ -96,6 +96,7 @@ This module has additional documentation
 <li><code><a title="pyatv.settings.RaopSettings.control_port" href="#pyatv.settings.RaopSettings.control_port">control_port</a></code></li>
 <li><code><a title="pyatv.settings.RaopSettings.credentials" href="#pyatv.settings.RaopSettings.credentials">credentials</a></code></li>
 <li><code><a title="pyatv.settings.RaopSettings.identifier" href="#pyatv.settings.RaopSettings.identifier">identifier</a></code></li>
+<li><code><a title="pyatv.settings.RaopSettings.pair_buddy_address" href="#pyatv.settings.RaopSettings.pair_buddy_address">pair_buddy_address</a></code></li>
 <li><code><a title="pyatv.settings.RaopSettings.password" href="#pyatv.settings.RaopSettings.password">password</a></code></li>
 <li><code><a title="pyatv.settings.RaopSettings.protocol_version" href="#pyatv.settings.RaopSettings.protocol_version">protocol_version</a></code></li>
 <li><code><a title="pyatv.settings.RaopSettings.timing_port" href="#pyatv.settings.RaopSettings.timing_port">timing_port</a></code></li>
@@ -118,7 +119,7 @@ This module has additional documentation
 </header>
 <section id="section-intro">
 <p>Settings for configuring pyatv.</p>
-<div class="git-link-div"><a href="https://github.com/postlund/pyatv/blob/master/pyatv/settings.py#L1-L179" class="git-link">Browse git</a></div>
+<div class="git-link-div"><a href="https://github.com/postlund/pyatv/blob/master/pyatv/settings.py#L1-L188" class="git-link">Browse git</a></div>
 </section>
 <section>
 </section>
@@ -381,7 +382,7 @@ validated to form a valid model.</p>
 <p>Raises [<code>ValidationError</code>][pydantic_core.ValidationError] if the input data cannot be
 validated to form a valid model.</p>
 <p><code>self</code> is explicitly positional-only to allow <code>self</code> as a field name.</p></section>
-<div class="git-link-div"><a href="https://github.com/postlund/pyatv/blob/master/pyatv/settings.py#L165-L172" class="git-link">Browse git</a></div>
+<div class="git-link-div"><a href="https://github.com/postlund/pyatv/blob/master/pyatv/settings.py#L174-L181" class="git-link">Browse git</a></div>
 <h3>Ancestors</h3>
 <ul class="hlist">
 <li>pydantic.main.BaseModel</li>
@@ -420,7 +421,7 @@ validated to form a valid model.</p>
 <p>Raises [<code>ValidationError</code>][pydantic_core.ValidationError] if the input data cannot be
 validated to form a valid model.</p>
 <p><code>self</code> is explicitly positional-only to allow <code>self</code> as a field name.</p></section>
-<div class="git-link-div"><a href="https://github.com/postlund/pyatv/blob/master/pyatv/settings.py#L138-L162" class="git-link">Browse git</a></div>
+<div class="git-link-div"><a href="https://github.com/postlund/pyatv/blob/master/pyatv/settings.py#L138-L171" class="git-link">Browse git</a></div>
 <h3>Ancestors</h3>
 <ul class="hlist">
 <li>pydantic.main.BaseModel</li>
@@ -439,6 +440,14 @@ validated to form a valid model.</p>
 <dt id="pyatv.settings.RaopSettings.identifier"><code class="name">var <span class="ident">identifier</span> -> str | None = None</code></dt>
 <dd>
 <section class="desc"><p>The type of the None singleton.</p></section>
+</dd>
+<dt id="pyatv.settings.RaopSettings.pair_buddy_address"><code class="name">var <span class="ident">pair_buddy_address</span> -> str | None = None</code></dt>
+<dd>
+<section class="desc"><p>Address of the second half of a stereo pair.</p>
+<p>Set this to stream to both halves of a stereo pair (e.g. two HomePods) as one
+room, playing in sync from one timeline. Specify either just an address, e.g.
+"10.0.0.20", or an address and a port, e.g. "10.0.0.20:7000". The port used by
+this device is used when no port is specified.</p></section>
 </dd>
 <dt id="pyatv.settings.RaopSettings.password"><code class="name">var <span class="ident">password</span> -> str | None = None</code></dt>
 <dd>
@@ -467,7 +476,7 @@ mode (recommended), or 1 or 2 for AirPlay 1 or 2 respectively.</p></section>
 <p>Raises [<code>ValidationError</code>][pydantic_core.ValidationError] if the input data cannot be
 validated to form a valid model.</p>
 <p><code>self</code> is explicitly positional-only to allow <code>self</code> as a field name.</p></section>
-<div class="git-link-div"><a href="https://github.com/postlund/pyatv/blob/master/pyatv/settings.py#L175-L179" class="git-link">Browse git</a></div>
+<div class="git-link-div"><a href="https://github.com/postlund/pyatv/blob/master/pyatv/settings.py#L184-L188" class="git-link">Browse git</a></div>
 <h3>Ancestors</h3>
 <ul class="hlist">
 <li>pydantic.main.BaseModel</li>
