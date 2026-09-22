@@ -75,6 +75,7 @@ from pyatv.protocols.raop.protocols import (
     new_group_uuid,
 )
 from pyatv.protocols.raop.stream_client import PlaybackInfo, RaopListener, StreamClient
+from pyatv.settings import RaopSettings
 from pyatv.support.collections import dict_merge
 from pyatv.support.device_info import lookup_model, lookup_os
 from pyatv.support.http import HttpConnection, http_connect
@@ -130,6 +131,52 @@ def _parse_buddy_address(address: str, default_port: int) -> Tuple[str, int]:
     return host.strip(), int(port) if port else default_port
 
 
+def buddy_address(service: BaseService, settings: RaopSettings) -> Optional[str]:
+    """Return address of the other half of a stereo pair, if there is one.
+
+    Scanning fills in the buddy for a pair it recognized, but a configured
+    pair_buddy_address always wins: it is the escape hatch for anything scanning
+    got wrong, including a pair it should not have folded together.
+    """
+    configured = settings.pair_buddy_address
+    discovered = (
+        service.pair_buddy_address if isinstance(service, MutableService) else None
+    )
+    address = configured or discovered
+    if address is None:
+        return None
+
+    # Credentials live on the shared StreamContext, so both halves would
+    # authenticate with the primary's HAP long-term keys. That works for transient
+    # pairing, which carries no per-device state, but stored credentials are bound
+    # to the primary's pairing record and the buddy has no such pairing: it would
+    # reject the verify. There is nowhere to put the buddy's own credentials yet
+    # (pair_buddy_address is a bare address).
+    if extract_credentials(service) in (NO_CREDENTIALS, TRANSIENT_CREDENTIALS):
+        return address
+
+    if configured:
+        # Asked for explicitly, so say why it cannot be done instead of failing
+        # mid-handshake
+        raise exceptions.NotSupportedError(
+            "pair_buddy_address cannot be used with stored credentials: "
+            "the buddy would be verified with the primary's pairing"
+        )
+
+    # Nobody asked for this half, scanning offered it. Streaming to the device
+    # that was connected to is better than refusing to stream at all - but say so
+    # loudly rather than at debug level: scanning has already folded this half
+    # away, so from the outside a stereo pair has just quietly become one speaker.
+    _LOGGER.warning(
+        "Not streaming to stereo pair half %s: stored credentials for %s are bound "
+        "to that device only and per-half credentials are not supported, so only "
+        "one speaker will play. Remove the stored credentials to use the pair",
+        discovered,
+        service.identifier,
+    )
+    return None
+
+
 class RaopPlaybackManager:
     """Manage current play state for RAOP."""
 
@@ -182,24 +229,10 @@ class RaopPlaybackManager:
         ]
 
         # A stereo pair is streamed to as two receivers playing from one timeline,
-        # so connect to the other half as well when configured
-        buddy_address = self.core.settings.protocols.raop.pair_buddy_address
-        if buddy_address:
-            # Credentials live on the shared StreamContext, so both halves would
-            # authenticate with the primary's HAP long-term keys. That works for
-            # transient pairing, which carries no per-device state, but stored
-            # credentials are bound to the primary's pairing record and the buddy
-            # has no such pairing: it would reject the verify. There is nowhere
-            # to put the buddy's own credentials yet (pair_buddy_address is a
-            # bare address), so say that instead of failing mid-handshake.
-            credentials = extract_credentials(self.core.service)
-            if credentials not in (NO_CREDENTIALS, TRANSIENT_CREDENTIALS):
-                raise exceptions.NotSupportedError(
-                    "pair_buddy_address cannot be used with stored credentials: "
-                    "the buddy would be verified with the primary's pairing"
-                )
-
-            address, port = _parse_buddy_address(buddy_address, self.core.service.port)
+        # so connect to the other half as well when there is one
+        buddy = buddy_address(self.core.service, self.core.settings.protocols.raop)
+        if buddy:
+            address, port = _parse_buddy_address(buddy, self.core.service.port)
             _LOGGER.debug("Streaming to stereo pair buddy at %s:%d", address, port)
             protocols.append(await self._connect(address, port, protocol_class))
 

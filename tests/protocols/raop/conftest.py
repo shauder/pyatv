@@ -9,6 +9,7 @@ import pytest_asyncio
 from pyatv import connect
 from pyatv.conf import AppleTV, ManualService
 from pyatv.const import Protocol
+from pyatv.core import MutableService
 from pyatv.storage.memory_storage import MemoryStorage
 
 from tests.fake_device import FakeAppleTV, raop
@@ -83,5 +84,23 @@ async def raop_pair_client_fixture(raop_conf, raop_device2):
     )
 
     client = await connect(raop_conf, loop=asyncio.get_running_loop(), storage=storage)
+    yield client
+    await asyncio.gather(*client.close())
+
+
+@pytest_asyncio.fixture(name="raop_discovered_pair_client")
+async def raop_discovered_pair_client_fixture(
+    raop_device, raop_device2, raop_properties
+):
+    # The configuration scanning produces for a stereo pair: one config, whose
+    # RAOP service carries the other half, and no setting anywhere
+    service = MutableService(
+        "raop_id", Protocol.RAOP, raop_device.get_port(Protocol.RAOP), raop_properties
+    )
+    service.pair_buddy_address = f"127.0.0.1:{raop_device2.get_port(Protocol.RAOP)}"
+    conf = AppleTV("127.0.0.1", "Stereo Pair")
+    conf.add_service(service)
+
+    client = await connect(conf, loop=asyncio.get_running_loop())
     yield client
     await asyncio.gather(*client.close())

@@ -135,6 +135,12 @@ class MutableService(BaseService):
         self._requires_password = False
         self._pairing_requirement = PairingRequirement.Unsupported
 
+        # Address ("host" or "host:port") of a second receiver this service also
+        # drives: the other half of a stereo pair, filled in by scanning when two
+        # addresses turn out to be one device. Not a zeroconf property, as it is
+        # derived from comparing what several addresses advertised.
+        self.pair_buddy_address: Optional[str] = None
+
     @property
     def requires_password(self) -> bool:
         """Return if a password is required to access service."""
@@ -168,6 +174,7 @@ class MutableService(BaseService):
         )
         copy.pairing = self.pairing
         copy.requires_password = self.requires_password
+        copy.pair_buddy_address = self.pair_buddy_address
         return copy
 
 

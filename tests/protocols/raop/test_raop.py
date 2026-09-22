@@ -1,17 +1,22 @@
 """Unit tests for pyatv.protocols.raop."""
 
 from ipaddress import ip_address
+import logging
 from types import SimpleNamespace
 
 from deepdiff import DeepDiff
 import pytest
 
+from pyatv import exceptions
 from pyatv.const import DeviceModel, OperatingSystem, PairingRequirement, Protocol
 from pyatv.core import MutableService, mdns
 from pyatv.interface import DeviceInfo
-from pyatv.protocols.raop import device_info, scan, service_info
+from pyatv.protocols.raop import buddy_address, device_info, scan, service_info
 from pyatv.protocols.raop.protocols import StreamContext, StreamMember
 from pyatv.protocols.raop.stream_client import ControlClient
+from pyatv.settings import RaopSettings
+
+from tests.fake_device.airplay import DEVICE_CREDENTIALS as CREDENTIALS
 
 RAOP_SERVICE = "_raop._tcp.local"
 AIRPORT_SERVICE = "_airport._tcp.local"
@@ -217,3 +222,52 @@ def test_retransmit_attribution_tells_loopback_members_apart():
 
     assert control._find_member(("127.0.0.1", 50002)) is members[1]
     assert control._find_member(("127.0.0.1", 50001)) is members[0]
+
+
+# Stereo pair buddy: scanning fills it in on the service, a user can override it
+# in the settings
+
+
+def _raop_service(credentials=None, buddy=None) -> MutableService:
+    service = MutableService("id", Protocol.RAOP, 7000, {}, credentials=credentials)
+    service.pair_buddy_address = buddy
+    return service
+
+
+def test_buddy_address_without_pair():
+    assert buddy_address(_raop_service(), RaopSettings()) is None
+
+
+def test_buddy_address_from_scan():
+    service = _raop_service(buddy="10.0.0.20:7000")
+
+    assert buddy_address(service, RaopSettings()) == "10.0.0.20:7000"
+
+
+def test_configured_buddy_address_wins():
+    # The setting is the escape hatch for anything scanning got wrong, so it wins
+    # even when scanning found a buddy of its own
+    service = _raop_service(buddy="10.0.0.20:7000")
+    settings = RaopSettings(pair_buddy_address="10.0.0.30")
+
+    assert buddy_address(service, settings) == "10.0.0.30"
+
+
+def test_configured_buddy_address_rejected_with_stored_credentials():
+    settings = RaopSettings(pair_buddy_address="10.0.0.30")
+
+    with pytest.raises(exceptions.NotSupportedError):
+        buddy_address(_raop_service(credentials=CREDENTIALS), settings)
+
+
+def test_discovered_buddy_address_dropped_with_stored_credentials(caplog):
+    # Nobody asked for this buddy, so streaming to the device that was connected
+    # to beats refusing to stream at all. It is warned about rather than silently
+    # dropped: scanning has already folded that half away, so a pair has become
+    # one speaker with nothing else to show for it
+    service = _raop_service(credentials=CREDENTIALS, buddy="10.0.0.20:7000")
+
+    with caplog.at_level(logging.WARNING, logger="pyatv.protocols.raop"):
+        assert buddy_address(service, RaopSettings()) is None
+
+    assert "10.0.0.20:7000" in caplog.text

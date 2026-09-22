@@ -1228,6 +1228,7 @@ AirPlay uses two services, one for audio and one for video. They are described h
 | srcvers | 540.31.41 | AirPlay version
 | psi | UUID4 | Public AirPlay Pairing Identifier
 | gid | UUID4 | Group UUID
+| tsid | UUID5 | Tight sync identifier, the same on both halves of a stereo pair
 | pk  | UUID4 | Public key
 | acl | 0 | Access Control Level
 | deviceid | AA:BB:CC:DD:EE:FF | Device identifier, typically MAC address

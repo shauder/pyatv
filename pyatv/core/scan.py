@@ -59,6 +59,10 @@ DEVICE_INFO: str = "_device-info._tcp.local"
 DEVICE_INFO_TYPE: str = f"{DEVICE_INFO}."
 SLEEP_PROXY: str = "_sleep-proxy._udp.local"
 SLEEP_PROXY_TYPE: str = f"{SLEEP_PROXY}."
+AIRPLAY: str = "_airplay._tcp.local"
+
+# Tight-sync identifier: the same value on both halves of a stereo pair
+TIGHT_SYNC_ID: str = "tsid"
 
 # These ports have been "arbitrarily" chosen (see issue #580) because a device normally
 # listen on them (more or less). They are used as best-effort when for unicast scanning
@@ -94,6 +98,66 @@ def get_unique_identifiers(
         unique_id = get_unique_id(service.type, service.name, service.properties)
         if unique_id:
             yield unique_id
+
+
+def fold_stereo_pairs(configs: List[BaseConfig]) -> List[BaseConfig]:
+    """Fold the two halves of a stereo pair into a single configuration.
+
+    Two speakers bonded as a stereo pair advertise the same tight-sync identifier
+    ("tsid") in their AirPlay TXT record: they share one volume, split one stereo
+    image between them and are one device in HomeKit. They are therefore returned
+    as one configuration, with the other half's address attached to the surviving
+    half's RAOP service so that streaming drives both.
+
+    Nothing but "tsid" is used for this. The group a receiver is currently in
+    ("gid") and the leader flags change from session to session - a pair that is
+    streaming, or that was left split, can have both halves calling themselves a
+    leader - so nothing else is stable enough to say that two addresses are one
+    device. A room ("gpn") is not a device at all: it can hold several independent
+    speakers and pairs, and those stay separate configurations.
+    """
+    halves_by_tsid: Dict[str, List[BaseConfig]] = {}
+    for config in configs:
+        tsid = config.properties.get(AIRPLAY, {}).get(TIGHT_SYNC_ID)
+        if tsid and config.get_service(Protocol.RAOP):
+            halves_by_tsid.setdefault(tsid, []).append(config)
+
+    folded_away: Set[int] = set()
+    for tsid, halves in halves_by_tsid.items():
+        # A pair is exactly two halves. One half alone - the other is switched off,
+        # or this scan simply missed it - must keep working on its own, and a tsid
+        # seen on more than two addresses is not something this understands. Both
+        # are left alone rather than guessed at.
+        if len(halves) != 2:
+            continue
+
+        # An identifier is what a user types and what storage keys credentials by,
+        # so a pair is folded into one of the halves instead of being given an
+        # identity of its own, and that half is picked by something that does not
+        # move: the lower identifier. Which half leads does move, per session.
+        primary, buddy = sorted(halves, key=lambda config: config.identifier or "")
+
+        # Two halves are two devices. One speaker answering at two addresses is
+        # not: a stale A record lives in the zeroconf cache beside the new one for
+        # a while after DHCP moves a receiver, and for that window one HomePod is
+        # two configurations with one identifier. Folding those together would
+        # open two sessions to the same receiver and let scan order pick which of
+        # the two addresses - one of them dead - the caller is handed.
+        if not primary.identifier or primary.identifier == buddy.identifier:
+            continue
+
+        service = primary.get_service(Protocol.RAOP)
+        buddy_service = buddy.get_service(Protocol.RAOP)
+        if not isinstance(service, MutableService) or buddy_service is None:
+            continue
+
+        service.pair_buddy_address = f"{buddy.address}:{buddy_service.port}"
+        folded_away.add(id(buddy))
+        _LOGGER.debug(
+            "Stereo pair %s: folded %s into %s", tsid, buddy.address, primary.address
+        )
+
+    return [config for config in configs if id(config) not in folded_away]
 
 
 def _empty_handler(service: mdns.Service, response: mdns.Response) -> None:
@@ -316,8 +380,17 @@ class MulticastMdnsScanner(BaseScanner):
             self.handle_response(response)
 
     def _end_if_identifier_found(self, response: mdns.Response):
-        return self.identifier and not self.identifier.isdisjoint(
+        if self.identifier is None or self.identifier.isdisjoint(
             set(get_unique_identifiers(response))
+        ):
+            return False
+
+        # Ending here throws away every other response, so a half of a stereo pair
+        # must not end it: the other half answers under an identifier of its own
+        # and there would be nothing left to fold it into. Keep listening and let
+        # the timeout finish the scan.
+        return not any(
+            service.properties.get(TIGHT_SYNC_ID) for service in response.services
         )
 
 

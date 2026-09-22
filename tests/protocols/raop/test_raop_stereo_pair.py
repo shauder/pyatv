@@ -16,10 +16,22 @@ from tests.utils import data_path, until
 pytestmark = pytest.mark.asyncio
 
 
-
 @pytest.mark.parametrize("raop_properties", [{"et": "0"}])
 async def test_stream_file_to_both_halves(raop_pair_client, raop_state, raop_state2):
     await raop_pair_client.stream.stream_file(data_path("audio_10_frames.wav"))
+
+    assert await audio_matches(raop_state.raw_audio, frames=10)
+    assert await audio_matches(raop_state2.raw_audio, frames=10)
+
+
+@pytest.mark.parametrize("raop_properties", [{"et": "0"}])
+async def test_stream_file_to_pair_found_by_scanning(
+    raop_discovered_pair_client, raop_state, raop_state2
+):
+    # Nothing is configured here: the pair came out of a scan as one config
+    await raop_discovered_pair_client.stream.stream_file(
+        data_path("audio_10_frames.wav")
+    )
 
     assert await audio_matches(raop_state.raw_audio, frames=10)
     assert await audio_matches(raop_state2.raw_audio, frames=10)

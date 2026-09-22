@@ -21,6 +21,7 @@ from pyatv.core.scan import (
     UnicastMdnsScanner,
     ZeroconfMulticastScanner,
     ZeroconfUnicastScanner,
+    fold_stereo_pairs,
 )
 from pyatv.interface import Storage
 from pyatv.protocols import PROTOCOLS
@@ -90,7 +91,25 @@ async def scan(  # pylint: disable=too-many-locals
     storage = storage or MemoryStorage()
 
     devices = (await scanner.discover(timeout)).values()
-    filtered_devices = [device for device in devices if _should_include(device)]
+    ready_devices = [device for device in devices if device.ready]
+
+    # Folded before filtering: a stereo pair is one device, and the identifier
+    # scanning prints for it is the one a caller passes back in, so asking for
+    # that identifier has to give the whole pair and not the half it came from
+    folded_devices = fold_stereo_pairs(ready_devices)
+
+    candidates = list(folded_devices)
+    if identifier:
+        # ...but the half that folding put away is still addressable on its own:
+        # asking for it by identifier is asking for that one speaker, which is
+        # what its own credentials are stored against. It is offered here as it
+        # was found, and only matches when its identifier was actually asked for.
+        folded_in = {id(device) for device in folded_devices}
+        candidates += [
+            device for device in ready_devices if id(device) not in folded_in
+        ]
+
+    filtered_devices = [device for device in candidates if _should_include(device)]
 
     for device in filtered_devices:
         settings = await storage.get_settings(device)

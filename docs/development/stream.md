@@ -195,9 +195,62 @@ There are a few caveats worth knowing:
 ## Stereo Pairs
 
 Two speakers that form a stereo pair (e.g. two HomePods) are two independent
-receivers: each one has to be streamed to on its own. To play to both halves as
-one room, set `protocols.raop.pair_buddy_address` in the settings to the address
-of the *other* half and stream to the first half as usual:
+receivers on the network, but one device: they are bonded in HomeKit, share one
+volume and split one stereo image between them. Scanning returns them as **one**
+configuration, and streaming to it drives both halves:
+
+```python
+atvs = await scan(loop)  # a stereo pair is one entry here, not two
+
+atv = await connect(atvs[0], loop)
+await atv.stream.stream_file("sample.mp3")
+```
+
+Both halves are then set up as one playback group and fed the same audio from one
+timeline, anchored at the same point in time and kept in sync by one (NTP) timing
+server. They do play in sync: this has been verified by ear on a pair of HomePods
+running audioOS 27, over a 30 second and a five minute run, with both halves
+taking their time from the one timing server (32 requests answered between them
+over the 30 second run). That is a listener's verdict over those durations, not a
+measurement of drift.
+
+What makes two addresses one device is the tight-sync identifier (`tsid`) in the
+AirPlay TXT record, which is the same on both halves and does not change. The
+group a receiver is in (`gid`) and the "is group leader" flags are *not* used:
+they change from session to session, and a pair that is playing, or that a sender
+left split, can have both halves calling themselves a leader. A room name (`gpn`)
+is not used either: a room can hold several independent speakers and pairs, and
+those stay separate configurations.
+
+A few things are worth knowing:
+
+* The pair keeps the identifier of one of its halves rather than getting a new
+  one, so credentials that were already stored still apply. Which half is picked
+  does not depend on which one currently leads.
+* Only a pair both of whose halves are seen in the same scan is folded together.
+  A half whose partner is switched off is returned on its own and can be streamed
+  to on its own, as before. One speaker answering at two addresses - a stale DNS
+  record beside a new one after DHCP moved it - is not a pair and is left alone:
+  two halves have to be two devices.
+* The identifier scanning prints for a pair means the pair, whether it is passed
+  back to `scan(loop, identifier=...)` or to `atvremote --id`. The *other* half's
+  identifier still means that half alone, so a single speaker of a pair can be
+  addressed when it needs to be.
+* Volume is a property of the pair, so both halves are set to the same volume and
+  a pair reports one volume level for both halves.
+* Streaming twice in rapid succession can fail: a pair goes through a transitional
+  state for a few seconds after a session is torn down, where it may refuse to set
+  up a new session. Waiting about 15 seconds between streams avoids that.
+* More than two receivers is not supported: only one buddy per device, and nothing
+  beyond a stereo pair has been verified.
+* The halves stay a stereo pair while pyatv streams to them, and render their own
+  left and right channels ([below](#the-pair-stays-a-pair)).
+
+### Pairing the halves up by hand
+
+`protocols.raop.pair_buddy_address` overrides what scanning worked out. Set it to
+the address of the *other* half to pair two receivers up that scanning did not, or
+to pick a different second half than it did:
 
 ```python
 settings = await storage.get_settings(conf)
@@ -215,27 +268,21 @@ atvremote -s 10.0.0.10 --id <identifier> \
     change_setting=protocols.raop.pair_buddy_address,10.0.0.20 stream_file=sample.mp3
 ```
 
-Both halves are then set up as one playback group and fed the same audio from one
-timeline, anchored at the same point in time and kept in sync by one (NTP) timing
-server. They do play in sync: this has been verified by ear on a pair of HomePods
-running audioOS 27, over a 30 second and a five minute run, with both halves
-taking their time from the one timing server (32 requests answered between them
-over the 30 second run). That is a listener's verdict over those durations, not a
-measurement of drift.
+This address is static: it is not discovered, so a device that gets a new address
+from DHCP silently breaks the setup. That is the price of overriding scanning.
 
-A few things are worth knowing:
+Neither the setting nor the automatic grouping works when credentials are stored
+for the device: both halves would be verified with the primary's pairing, which
+the other half has no record of. A buddy that scanning found is dropped in that
+case and only the device connected to is streamed to, while the setting, having
+been asked for explicitly, raises `NotSupportedError`.
 
-* The address is static: it is not discovered, so a device that gets a new address
-  from DHCP silently breaks the setup.
-* Volume is a property of the pair, so both halves are set to the same volume and
-  a pair reports one volume level for both halves.
-* Streaming twice in rapid succession can fail: a pair goes through a transitional
-  state for a few seconds after a session is torn down, where it may refuse to set
-  up a new session. Waiting about 15 seconds between streams avoids that.
-* More than two receivers is not supported: only one buddy can be configured, and
-  nothing beyond a stereo pair has been verified.
-* The halves stay a stereo pair while pyatv streams to them, and render their own
-  left and right channels ([below](#the-pair-stays-a-pair)).
+This is worth knowing before pairing a stereo pair, because scanning cannot see
+it coming: credentials are read from storage after scanning has already folded
+the two halves together. So a pair with stored credentials is listed as one
+device, plays out of one speaker, and logs a warning saying so - the other half
+is neither in the scan results nor streamed to. Until per-half credentials exist,
+either leave the pair unpaired or expect one speaker.
 
 ### The pair stays a pair
 
@@ -247,7 +294,7 @@ channel-related — the speakers do the rest.
 
 What splits a pair is a session that names no group, not the timing protocol: a
 sender whose session sends no `groupUUID` leaves each half in a group of its own,
-rendering the whole mix. pyatv sends one whenever `pair_buddy_address` is set.
+rendering the whole mix. pyatv sends one whenever it streams to both halves.
 
 #### Group state, read off the network
 
@@ -260,7 +307,7 @@ HomePods running audioOS 27, with samples taken through live sessions:
 | State of the pair | One half | The other half |
 | ----------------- | -------- | -------------- |
 | Bonded, nothing playing | `igl=1 gcgl=1`, shared `gid` | `igl=0 gcgl=1`, the same `gid` |
-| Streamed to by pyatv, `pair_buddy_address` set (NTP) | `igl=0 gcgl=0`, pyatv's `gid` | `igl=0 gcgl=0`, the same `gid` |
+| Streamed to by pyatv, both halves (NTP) | `igl=0 gcgl=0`, pyatv's `gid` | `igl=0 gcgl=0`, the same `gid` |
 | Streamed to over a shared PTP timeline | `igl=0 gcgl=0`, the sender's `gid` | `igl=0 gcgl=0`, the same `gid` |
 | Streamed to by a session that names no group | `igl=1`, a `gid` of its own | `igl=1`, a different `gid` |
 
@@ -271,7 +318,7 @@ channels itself.
 
 The bottom row is what a session without a `groupUUID` does; it was measured with
 another sender, driven both ways on the same pair, not with pyatv. pyatv sends a
-`groupUUID` whenever `pair_buddy_address` is set, together with
+`groupUUID` whenever it streams to both halves, together with
 `senderSupportsRelay: true`, without which a receiver ignores the group.
 
 The TXT record is also how you can check it on your own pair, with `dns-sd -L` or
