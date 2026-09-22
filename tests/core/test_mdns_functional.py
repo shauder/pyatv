@@ -16,6 +16,7 @@ from tests import fake_udns, utils
 
 SERVICE_NAME = "Kitchen"
 MEDIAREMOTE_SERVICE = "_mediaremotetv._tcp.local"
+AIRPLAY_SERVICE = "_airplay._tcp.local"
 DEVICE_INFO_SERVICE = "_device-info._tcp._local"
 
 SERVICES_PER_REQUEST = 3
@@ -250,6 +251,132 @@ async def test_multicast_sleeping_device(udns_server, multicast_fastexit):
         asyncio.get_running_loop(), [MEDIAREMOTE_SERVICE], "127.0.0.1", udns_server.port
     )
     assert len(resp) == 1
+
+
+def queued_questions(protocol, address):
+    """Return the questions queued for direct delivery to one host.
+
+    Both queues: a device a sleep proxy answered for is asked for by instance, and a
+    host that never answered for a type is asked for that type. One host can need both,
+    which is why they are kept apart.
+    """
+    return {
+        question.qname
+        for query in (
+            *protocol._unicasts.get(address, []),
+            *protocol._type_queries.get(address, []),
+        )
+        for question in mdns.DnsMessage().unpack(query).questions
+    }
+
+
+async def answer_from_host(protocol, services):
+    """Deliver one host's answer to the protocol, as the fake device would give it."""
+    request = mdns.create_service_queries(services, mdns.QueryType.PTR)[0]
+    response = fake_udns.create_response(request, TEST_SERVICES)
+    protocol.datagram_received(response.pack(), ("10.0.0.1", 5353))
+
+
+async def multicast_protocol(services):
+    return mdns.MulticastDnsSdClientProtocol(
+        asyncio.get_running_loop(), services, "127.0.0.1", 5353, None
+    )
+
+
+async def test_multicast_asks_host_about_type_it_stayed_silent_on():
+    services = [MEDIAREMOTE_SERVICE, AIRPLAY_SERVICE]
+    protocol = await multicast_protocol(services)
+
+    # An awake device: it answers in full for one type and says nothing whatsoever
+    # about the other, which is how the sleepiest speakers behave on a real network.
+    await answer_from_host(protocol, services)
+
+    assert queued_questions(protocol, "10.0.0.1") == {
+        AIRPLAY_SERVICE,
+        mdns.SLEEP_PROXY_SERVICE,
+    }
+
+
+async def test_multicast_asks_nothing_of_a_host_that_answered_in_full():
+    # The service list a real scan uses, which always includes two types that CANNOT
+    # come back with an endpoint: `_device-info` is TXT-only and has no SRV, and an
+    # ordinary device never answers for `_sleep-proxy` at all. Treating their absence
+    # as an unanswered type makes every host on the network look like it is holding
+    # something back, and it would then be asked for them once a second, all scan long.
+    protocol = await multicast_protocol(
+        [MEDIAREMOTE_SERVICE, mdns.DEVICE_INFO_SERVICE, mdns.SLEEP_PROXY_SERVICE]
+    )
+
+    await answer_from_host(protocol, [MEDIAREMOTE_SERVICE])
+
+    assert queued_questions(protocol, "10.0.0.1") == set()
+
+
+async def test_multicast_keeps_asking_for_a_sleeping_device_behind_a_proxy():
+    """A sleep proxy is usually a device in its own right.
+
+    It answers for the sleeping device with port 0, and for itself with real ports. The
+    instance-scoped follow-up for the sleeping device is the only thing that resolves
+    it, so a later packet from the same host asking about ITS missing types must not
+    replace that follow-up.
+    """
+    services = [MEDIAREMOTE_SERVICE, AIRPLAY_SERVICE]
+    protocol = await multicast_protocol(services)
+
+    # First: the host answers as a proxy for something asleep - every port 0.
+    request = mdns.create_service_queries(services, mdns.QueryType.PTR)[0]
+    asleep = fake_udns.create_response(request, TEST_SERVICES, sleep_proxy=True)
+    protocol.datagram_received(asleep.pack(), ("10.0.0.1", 5353))
+
+    asked_for_sleeper = queued_questions(protocol, "10.0.0.1")
+    assert asked_for_sleeper, "the sleeping device must be asked for by instance"
+
+    # Then: the same host answers for itself, still silent on one of its own types.
+    await answer_from_host(protocol, services)
+
+    assert asked_for_sleeper <= queued_questions(
+        protocol, "10.0.0.1"
+    ), "the sleeping device's follow-up was dropped when the host asked about itself"
+    assert AIRPLAY_SERVICE in queued_questions(protocol, "10.0.0.1")
+
+
+async def test_multicast_resolves_type_the_device_was_silent_on(udns_server):
+    udns_server.services = {
+        MEDIAREMOTE_SERVICE: TEST_SERVICES[MEDIAREMOTE_SERVICE],
+        AIRPLAY_SERVICE: fake_udns.airplay_service(SERVICE_NAME, "aa:bb:cc:dd:ee:ff")[
+            1
+        ],
+    }
+    udns_server.silent_services = {AIRPLAY_SERVICE}
+
+    def _airplay_resolved(response):
+        return any(
+            service.type == AIRPLAY_SERVICE and service.port != 0
+            for service in response.services
+        )
+
+    resp = await mdns.multicast(
+        asyncio.get_running_loop(),
+        [MEDIAREMOTE_SERVICE, AIRPLAY_SERVICE],
+        "127.0.0.1",
+        udns_server.port,
+        timeout=3,
+        end_condition=_airplay_resolved,
+    )
+    assert len(resp) == 1
+
+    # The device answered for one type, so it is awake and must not be taken for a
+    # sleeping one just because a follow-up was needed.
+    assert not resp[0].deep_sleep
+
+    services = {service.type: service for service in resp[0].services}
+    assert services[MEDIAREMOTE_SERVICE].port == 1234
+
+    airplay = services[AIRPLAY_SERVICE]
+    assert airplay.name == SERVICE_NAME
+    assert airplay.port == 7000
+    assert airplay.address == IPv4Address("127.0.0.1")
+    assert airplay.properties["deviceid"] == "aa:bb:cc:dd:ee:ff"
 
 
 async def test_multicast_deep_sleep(udns_server, multicast_fastexit):

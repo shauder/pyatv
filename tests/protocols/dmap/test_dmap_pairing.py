@@ -80,7 +80,11 @@ async def mock_pairing(storage):
 
         settings = await storage.get_settings(config)
         core = await create_core(
-            config, service, settings=settings, loop=asyncio.get_running_loop()
+            config,
+            service,
+            settings=settings,
+            loop=asyncio.get_running_loop(),
+            storage=storage,
         )
 
         obj.pairing = pairing.DmapPairingHandler(core, **options)

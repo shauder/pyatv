@@ -3,9 +3,28 @@
 import asyncio
 import io
 import logging
-from typing import Any, Dict, Generator, Mapping, Optional, Set, Tuple, Union, cast
+from typing import (
+    Any,
+    Dict,
+    Generator,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Set,
+    Tuple,
+    Type,
+    Union,
+    cast,
+)
 
 from pyatv import const, exceptions
+from pyatv.auth.hap_pairing import (
+    NO_CREDENTIALS,
+    TRANSIENT_CREDENTIALS,
+    HapCredentials,
+    parse_credentials,
+)
 from pyatv.const import (
     DeviceModel,
     FeatureName,
@@ -42,6 +61,7 @@ from pyatv.interface import (
     Playing,
     PushUpdater,
     RemoteControl,
+    Storage,
     Stream,
 )
 from pyatv.protocols.airplay.auth import extract_credentials
@@ -54,8 +74,15 @@ from pyatv.protocols.airplay.utils import (
     update_service_details,
 )
 from pyatv.protocols.raop.audio_source import AudioSource, open_source
-from pyatv.protocols.raop.protocols import StreamContext, airplayv1, airplayv2
+from pyatv.protocols.raop.protocols import (
+    StreamContext,
+    StreamProtocol,
+    airplayv1,
+    airplayv2,
+    new_group_uuid,
+)
 from pyatv.protocols.raop.stream_client import PlaybackInfo, RaopListener, StreamClient
+from pyatv.settings import RaopSettings
 from pyatv.support.collections import dict_merge
 from pyatv.support.device_info import lookup_model, lookup_os
 from pyatv.support.http import HttpConnection, http_connect
@@ -105,6 +132,97 @@ class RaopPushUpdater(AbstractPushUpdater):
             _LOGGER.debug("Playstatus error occurred: %s", ex)
 
 
+def _parse_partner_address(address: str, default_port: int) -> Tuple[str, int]:
+    """Split an "address" or "address:port" setting into address and port."""
+    host, _, port = address.partition(":")
+    return host.strip(), int(port) if port else default_port
+
+
+class PairPartner(NamedTuple):
+    """The other half of a stereo pair: where it is and what it is verified with."""
+
+    address: str
+    port: int
+    credentials: HapCredentials
+
+
+def _stored_raop_credentials(storage: Storage, identifier: str) -> Optional[str]:
+    """Return RAOP credentials stored for a device other than the one connected to.
+
+    Searched by identifier rather than through `get_settings`, which needs a
+    configuration the folded-away half no longer has and would create an empty
+    record for a device that has none.
+    """
+    for settings in storage.settings:
+        if settings.protocols.raop.identifier == identifier:
+            return settings.protocols.raop.credentials
+    return None
+
+
+def pair_partner(
+    service: BaseService, settings: RaopSettings, storage: Storage
+) -> Optional[PairPartner]:
+    """Return the other half of a stereo pair to stream to, if there is one.
+
+    Scanning fills in the partner for a pair it recognized, but a configured
+    stereo_pair_address always wins: it is the escape hatch for anything scanning
+    got wrong, including a pair it should not have folded together.
+
+    Credentials are per device and scanning cannot see them: it has no storage, and
+    folds the halves together before any settings are loaded. So the decision is made
+    here, where storage is at hand. A half that cannot be verified with anything -
+    this device paired, the other one not - is left out and this device streamed to
+    alone.
+    """
+    configured = settings.stereo_pair_address
+    discovered, identifier = (
+        (service.stereo_pair_address, service.stereo_pair_identifier)
+        if isinstance(service, MutableService)
+        else (None, None)
+    )
+    address = configured or discovered
+    if address is None:
+        return None
+
+    host, port = _parse_partner_address(address, service.port)
+    credentials = extract_credentials(service)
+
+    # Which half the fold kept is arbitrary (lower identifier), so the other half's
+    # own pairing is what counts, whatever this device uses. Only scanning knows which
+    # device answers at an address, so a hand-configured one is not looked up.
+    partner_credentials = (
+        _stored_raop_credentials(storage, identifier)
+        if identifier and not configured
+        else None
+    )
+    if partner_credentials:
+        return PairPartner(host, port, parse_credentials(partner_credentials))
+
+    # Nothing is bound to this device either: transient pairing carries no per-device
+    # state and an unpaired receiver demands nothing. Both halves are then driven with
+    # what this device uses, which is the normal case for a pair of HomePods.
+    if credentials in (NO_CREDENTIALS, TRANSIENT_CREDENTIALS):
+        return PairPartner(host, port, credentials)
+
+    if configured:
+        raise exceptions.NotSupportedError(
+            "stereo_pair_address cannot be used with stored credentials: an address "
+            "does not say which device it is, and credentials are stored per device. "
+            "Unset it and let scanning group the pair, or remove the credentials"
+        )
+
+    # Only one half is paired: stream to it rather than refusing, which is what
+    # happened before the fold, but say so and say what makes both play.
+    _LOGGER.warning(
+        "Streaming to %s only: the other half of the stereo pair (%s) has no stored "
+        "credentials of its own, and this device's cannot be used for it. Pair that "
+        "half as well to stream to both speakers",
+        service.identifier,
+        identifier or discovered,
+    )
+    return None
+
+
 class RaopPlaybackManager:
     """Manage current play state for RAOP."""
 
@@ -114,8 +232,7 @@ class RaopPlaybackManager:
         self.playback_info: Optional[PlaybackInfo] = None
         self._is_acquired: bool = False
         self._context: StreamContext = StreamContext()
-        self._connection: Optional[HttpConnection] = None
-        self._rtsp: Optional[RtspSession] = None
+        self._connections: List[HttpConnection] = []
         self._stream_client: Optional[StreamClient] = None
 
     @property
@@ -137,13 +254,8 @@ class RaopPlaybackManager:
 
     async def setup(self, service: BaseService) -> Tuple[StreamClient, StreamContext]:
         """Set up a session or return active if it exists."""
-        if self._stream_client and self._rtsp and self._context:
+        if self._stream_client:
             return self._stream_client, self._context
-
-        self._connection = await http_connect(
-            str(self.core.config.address), self.core.service.port
-        )
-        self._rtsp = RtspSession(self._connection)
 
         protocol_version = get_protocol_version(
             service, self.core.settings.protocols.raop.protocol_version
@@ -156,25 +268,70 @@ class RaopPlaybackManager:
             else airplayv2.AirPlayV2
         )
 
-        self._stream_client = StreamClient(
-            self._rtsp,
-            self._context,
-            protocol_class(self._context, self._rtsp),
-            self.core.settings,
+        # What the session authenticates with unless a receiver brings its own
+        self._context.credentials = extract_credentials(service)
+
+        protocols = [
+            await self._connect(
+                str(self.core.config.address), self.core.service.port, protocol_class
+            )
+        ]
+
+        # A stereo pair is streamed to as two receivers playing from one timeline,
+        # so connect to the other half as well when there is one
+        partner = pair_partner(
+            self.core.service, self.core.settings.protocols.raop, self.core.storage
         )
+        if partner:
+            _LOGGER.debug(
+                "Streaming to stereo pair partner at %s:%d",
+                partner.address,
+                partner.port,
+            )
+            protocols.append(
+                await self._connect(
+                    partner.address, partner.port, protocol_class, partner.credentials
+                )
+            )
+
+        # The SSRC identifies the audio stream and is shared by everyone receiving it
+        self._context.ssrc = protocols[0].rtsp.session_id
+
+        # Receivers belonging to the same playback group are told so by a group
+        # identifier that all members share. It is randomly generated (and thus a
+        # version 4 UUID) once per group: a version 5 UUID would claim to be a
+        # group the receivers formed themselves. Only set when grouping, as it
+        # changes how a receiver treats the session.
+        self._context.group_uuid = new_group_uuid() if len(protocols) > 1 else None
+
+        self._stream_client = StreamClient(self._context, protocols, self.core.settings)
         return self._stream_client, self._context
+
+    async def _connect(
+        self,
+        address: str,
+        port: int,
+        protocol_class: Type[StreamProtocol],
+        credentials: Optional[HapCredentials] = None,
+    ) -> StreamProtocol:
+        """Connect to one receiver and return a protocol instance for it.
+
+        Credentials are the session's (i.e. the device connected to) unless this
+        receiver brought its own, which the other half of a paired stereo pair does.
+        """
+        connection = await http_connect(address, port)
+        self._connections.append(connection)
+        return protocol_class(self._context, RtspSession(connection), credentials)
 
     async def teardown(self) -> None:
         """Tear down and disconnect current session."""
         if self._stream_client:
             self._stream_client.close()
-        if self._connection:
-            self._connection.close()
-            self._connection = None
+        for connection in self._connections:
+            connection.close()
+        self._connections = []
         self._stream_client = None
         self._context.reset()
-        self._rtsp = None
-        self._connection = None
         self._is_acquired = False
 
 
@@ -352,7 +509,6 @@ class RaopStream(Stream):
         )
         try:
             client, context = await self.playback_manager.setup(self.core.service)
-            context.credentials = extract_credentials(self.core.service)
             context.password = self.core.service.password
 
             client.listener = self.listener

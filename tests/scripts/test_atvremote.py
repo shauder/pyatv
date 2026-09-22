@@ -84,6 +84,16 @@ async def test_airplay_play_url(scriptenv):
     assert exit_code == 0
 
 
+async def test_name_not_found(scriptenv):
+    # Something is on the network, just nothing under that name. Folding a stereo
+    # pair makes this easy to reach: one of the two halves no longer has a name of
+    # its own to ask for
+    _, _, exit_code = await scriptenv(
+        "atvremote", "--name", "No Such Device", "playing"
+    )
+    assert exit_code == 1
+
+
 async def test_mrp_idle(scriptenv):
     stdout, _, exit_code = await scriptenv("atvremote", "--id", MRP_ID, "playing")
     assert all_in(stdout, "Media type: Unknown", "Device state: Idle")
@@ -138,7 +148,11 @@ async def test_settings(scriptenv):
     stdout, _, exit_code = await scriptenv(
         "atvremote", "--id", MRP_ID, "print_settings", persistent_storage=True
     )
-    assert all_in(stdout, "protocols.raop.password = None")
+    assert all_in(
+        stdout,
+        "protocols.raop.password = None",
+        "protocols.raop.stereo_pair_address = None",
+    )
     assert exit_code == 0
 
     # Change value of protocols.raop.password

@@ -14,7 +14,12 @@ from typing import Dict, Optional, cast
 from pyatv.interface import MediaMetadata
 from pyatv.protocols.dmap import parser
 from pyatv.protocols.dmap.tag_definitions import lookup_tag
-from pyatv.protocols.raop.packets import RetransmitReqeust, RtpHeader, SyncPacket
+from pyatv.protocols.raop.packets import (
+    AudioPacketHeader,
+    RetransmitReqeust,
+    RtpHeader,
+    SyncPacket,
+)
 from pyatv.protocols.raop.protocols.airplayv1 import parse_transport
 from pyatv.support.http import (
     BasicHttpServer,
@@ -62,6 +67,9 @@ class RaopServiceFlags(IntFlag):
     Some devices (at least Sonos) seems to fail when setting volume prior to starting
     a stream. This flag mimcs that behavior.
     """
+
+    TEARDOWN_FAILS = auto()
+    """Respond with an error to TEARDOWN."""
 
 
 def requires_auth(method):
@@ -136,6 +144,8 @@ class FakeRaopState:
         self.metadata = MediaMetadata()
         self.audio_packets: Dict[int, bytes] = {}  # seqo -> raw audio
         self.initial_audio_packet: Optional[int] = None
+        self.audio_ssrc: Optional[int] = None
+        self.rtsp_session_id: Optional[int] = None
         self.password: Optional[str] = None
         self.nonce: Optional[str] = None
         self.auth_setup_performed: bool = False
@@ -236,6 +246,9 @@ class AudioReceiver(asyncio.Protocol):
                         data, (self.state.remote_address, self.state.control_port)
                     )
             else:
+                self.state.audio_ssrc = AudioPacketHeader.decode(
+                    data, allow_excessive=True
+                ).ssrc
                 self.state.add_audio_packet(header.seqno, data[12:])
         elif packet_type == 0x56:  # Retransmission
             original_packet = data[4:]  # Remove retransmission header
@@ -413,7 +426,9 @@ class FakeRaopService(HttpSimpleRouter):
         _LOGGER.debug("Received ANNOUNCE: %s", request)
         for line in request.body.decode("utf-8").split("\r\n"):
             if line.startswith("o="):
-                self.state.remote_address = line.split()[-1]
+                fields = line.split()
+                self.state.rtsp_session_id = int(fields[1])
+                self.state.remote_address = fields[-1]
                 break
 
         return HttpResponse(
@@ -567,6 +582,15 @@ class FakeRaopService(HttpSimpleRouter):
     def handle_teardown(self, request: HttpRequest) -> Optional[HttpResponse]:
         """Handle incoming TEARDOWN request."""
         self.state.teardown_called = True
+        if self.state.is_supported(RaopServiceFlags.TEARDOWN_FAILS):
+            return HttpResponse(
+                "RTSP",
+                "1.0",
+                500,
+                "Internal Server Error",
+                {"CSeq": request.headers["CSeq"]},
+                b"",
+            )
         return HttpResponse(
             "RTSP", "1.0", 200, "OK", {"CSeq": request.headers["CSeq"]}, b""
         )
@@ -607,6 +631,10 @@ class FakeRaopUseCases:
     def supports_info(self, is_supported: bool) -> None:
         """State if /info is supported or not."""
         self.state.set_flag_state(RaopServiceFlags.INFO_SUPPORTED, is_supported)
+
+    def teardown_fails(self, fails: bool) -> None:
+        """Respond with an error to TEARDOWN or not."""
+        self.state.set_flag_state(RaopServiceFlags.TEARDOWN_FAILS, fails)
 
     def delayed_set_volume(self, delayed_set_volume) -> None:
         """Enable or disable delayed set volume."""

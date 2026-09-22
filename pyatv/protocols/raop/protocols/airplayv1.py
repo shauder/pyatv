@@ -7,6 +7,7 @@ from typing import List, Mapping, Optional, Tuple
 from uuid import uuid4
 
 from pyatv import exceptions
+from pyatv.auth.hap_pairing import HapCredentials
 from pyatv.protocols.airplay.auth import pair_verify
 from pyatv.protocols.raop.protocols import StreamContext, StreamProtocol
 from pyatv.support.rtsp import RtspSession
@@ -37,16 +38,19 @@ def parse_transport(transport: str) -> Tuple[List[str], Mapping[str, str]]:
 class AirPlayV1(StreamProtocol):
     """Stream protocol used for AirPlay v1 support."""
 
-    def __init__(self, context: StreamContext, rtsp: RtspSession) -> None:
+    def __init__(
+        self,
+        context: StreamContext,
+        rtsp: RtspSession,
+        credentials: Optional[HapCredentials] = None,
+    ) -> None:
         """Initialize a new AirPlayV1 instance."""
-        super().__init__()
-        self.context = context
-        self.rtsp = rtsp
+        super().__init__(context, rtsp, credentials)
         self._keep_alive_task: Optional[asyncio.Future] = None
 
     async def setup(self, timing_server_port: int, control_client_port: int) -> None:
         """To setup connection prior to starting to stream."""
-        verifier = pair_verify(self.context.credentials, self.rtsp.connection)
+        verifier = pair_verify(self.credentials, self.rtsp.connection)
         await verifier.verify_credentials()
 
         await self.rtsp.announce(
@@ -66,16 +70,16 @@ class AirPlayV1(StreamProtocol):
             }
         )
         _, options = parse_transport(resp.headers["Transport"])
-        self.context.timing_port = int(options.get("timing_port", 0))
-        self.context.control_port = int(options["control_port"])
-        self.context.rtsp_session = int(resp.headers["Session"])
-        self.context.server_port = int(options["server_port"])
+        self.member.timing_port = int(options.get("timing_port", 0))
+        self.member.control_port = int(options["control_port"])
+        self.member.rtsp_session = int(resp.headers["Session"])
+        self.member.server_port = int(options["server_port"])
 
         _LOGGER.debug(
             "Remote ports: control=%d, timing=%d, server=%d",
-            self.context.control_port,
-            self.context.timing_port,
-            self.context.server_port,
+            self.member.control_port,
+            self.member.timing_port,
+            self.member.server_port,
         )
 
     def teardown(self) -> None:
@@ -118,7 +122,7 @@ class AirPlayV1(StreamProtocol):
 
     async def play_url(self, timing_server_port: int, url: str, position: float = 0.0):
         """Play media from a URL."""
-        verifier = pair_verify(self.context.credentials, self.rtsp.connection)
+        verifier = pair_verify(self.credentials, self.rtsp.connection)
         await verifier.verify_credentials()
 
         body = {

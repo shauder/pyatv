@@ -9,14 +9,13 @@ from abc import ABC, abstractmethod
 import asyncio
 import logging
 from time import monotonic, monotonic_ns
-from typing import Any, Dict, Mapping, NamedTuple, Optional, Tuple, cast
+from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Tuple, cast
 import weakref
 
 from pyatv import exceptions
 from pyatv.protocols.airplay.utils import pct_to_dbfs
 from pyatv.protocols.raop import timing
 from pyatv.protocols.raop.audio_source import AudioSource
-from pyatv.protocols.raop.fifo import PacketFifo
 from pyatv.protocols.raop.packets import (
     AudioPacketHeader,
     RetransmitReqeust,
@@ -29,7 +28,12 @@ from pyatv.protocols.raop.parsers import (
     get_encryption_types,
     get_metadata_types,
 )
-from pyatv.protocols.raop.protocols import StreamContext, StreamProtocol, TimingServer
+from pyatv.protocols.raop.protocols import (
+    StreamContext,
+    StreamMember,
+    StreamProtocol,
+    TimingServer,
+)
 from pyatv.settings import Settings
 from pyatv.support import log_binary
 from pyatv.support.metadata import EMPTY_METADATA, MediaMetadata
@@ -39,9 +43,6 @@ _LOGGER = logging.getLogger(__name__)
 
 # When being late, compensate by sending at most these many packets to catch up
 MAX_PACKETS_COMPENSATE = 3
-
-# We should store this many packets in case retransmission is requested
-PACKET_BACKLOG_SIZE = 1000
 
 # Number of "too slow to keep up" warnings to suppress before warning about them
 SLOW_WARNING_THRESHOLD = 5
@@ -64,11 +65,11 @@ class PlaybackInfo(NamedTuple):
 class ControlClient(asyncio.Protocol):
     """Control client responsible for e.g. sync packets."""
 
-    def __init__(self, context: StreamContext, packet_backlog: PacketFifo):
+    def __init__(self, context: StreamContext, members: List[StreamMember]):
         """Initialize a new ControlClient."""
         self.transport = None
         self.context = context
-        self.packet_backlog = packet_backlog
+        self.members = members
         self.task: Optional[asyncio.Future] = None
 
     def close(self):
@@ -82,13 +83,22 @@ class ControlClient(asyncio.Protocol):
         """Port this control client listens to."""
         return self.transport.get_extra_info("socket").getsockname()[1]
 
-    def start(self, addr: str):
-        """Start sending periodic sync messages."""
+    def start(self):
+        """Start sending periodic sync messages.
+
+        The same sync packet is sent to every member of the session, as they all
+        play from one and the same timeline.
+        """
         _LOGGER.debug("Starting periodic sync task")
+
+        destinations = [
+            (member.rtsp.connection.remote_ip, member.control_port)
+            for member in self.members
+        ]
 
         async def _sync_handler():
             try:
-                await self._sync_task((addr, self.context.control_port))
+                await self._sync_task(destinations)
             except asyncio.CancelledError:
                 pass
             except Exception:
@@ -100,7 +110,7 @@ class ControlClient(asyncio.Protocol):
 
         self.task = asyncio.ensure_future(_sync_handler())
 
-    async def _sync_task(self, dest: Tuple[str, int]):
+    async def _sync_task(self, destinations: List[Tuple[str, int]]):
         if self.transport is None:
             raise RuntimeError("socket not connected")
 
@@ -128,7 +138,8 @@ class ControlClient(asyncio.Protocol):
             )
 
             first_packet = False
-            self.transport.sendto(packet, dest)
+            for dest in destinations:
+                self.transport.sendto(packet, dest)
 
             await asyncio.sleep(1.0)  # Very low granularity here
             current_time = timing.ts2ntp(self.context.head_ts, self.context.sample_rate)
@@ -152,12 +163,52 @@ class ControlClient(asyncio.Protocol):
         else:
             _LOGGER.debug("Received unhandled control data from %s: %s", addr, data)
 
+    def _find_member(self, addr) -> Optional[StreamMember]:
+        """Return the member a control message came from.
+
+        Every member has its own backlog, as the packets sent to them differ
+        (they are encrypted with different keys), so a retransmit request must be
+        served from the backlog belonging to the receiver that asked for it.
+        """
+        # With a single member there is nothing to attribute: serve it whatever
+        # address the request came from (this is how it has always worked)
+        if len(self.members) == 1:
+            return self.members[0]
+
+        # The address is what identifies a receiver; the control port is an
+        # ephemeral value each one picks for itself, so two identical speakers
+        # booted together can pick the same one. Matching the port first would
+        # then serve every request from the second half out of the first half's
+        # backlog, and the asking receiver cannot decrypt a packet sealed for its
+        # partner: the gap is never repaired and that speaker drops a packet for
+        # good, with nothing in the log because the request was "handled".
+        #
+        # Both halves of the address are matched first. The IP alone is not a
+        # safe primary key either: the test fixtures put every fake device on
+        # 127.0.0.1 and tell them apart by port only.
+        for member in self.members:
+            if (
+                addr[0] == member.rtsp.connection.remote_ip
+                and addr[1] == member.control_port
+            ):
+                return member
+        for member in self.members:
+            if addr[0] == member.rtsp.connection.remote_ip:
+                return member
+        return None
+
     def _retransmit_lost_packets(self, request, addr):
         _LOGGER.debug("%s from %s", request, addr)
 
+        member = self._find_member(addr)
+        if member is None:
+            _LOGGER.debug("Retransmit request from unknown receiver %s", addr)
+            return
+
+        backlog = member.packet_backlog
         for i in range(request.lost_packets):
-            if request.lost_seqno + i in self.packet_backlog:
-                packet = self.packet_backlog[request.lost_seqno + i]
+            if request.lost_seqno + i in backlog:
+                packet = backlog[request.lost_seqno + i]
 
                 # Very "low level" here just because it's simple and avoids
                 # unnecessary conversions
@@ -226,19 +277,24 @@ class StreamClient:
 
     def __init__(
         self,
-        rtsp: RtspSession,
         context: StreamContext,
-        protocol: StreamProtocol,
+        protocols: List[StreamProtocol],
         settings: Settings,
     ):
-        """Initialize a new StreamClient instance."""
+        """Initialize a new StreamClient instance.
+
+        More than one protocol instance means more than one receiver: the same
+        audio is then sent to all of them from one timeline, e.g. to play to both
+        halves of a stereo pair. The first protocol is the primary one.
+        """
+        if not protocols:
+            raise ValueError("at least one receiver is required")
+
         self.loop = asyncio.get_event_loop()
-        self.rtsp: RtspSession = rtsp
         self.context: StreamContext = context
         self.settings: Settings = settings
         self.control_client: Optional[ControlClient] = None
         self.timing_server: Optional[TimingServer] = None
-        self._packet_backlog: PacketFifo = PacketFifo(PACKET_BACKLOG_SIZE)
         self._encryption_types: EncryptionType = EncryptionType.Unknown
         self._metadata_types: MetadataType = MetadataType.NotSupported
         self._metadata: MediaMetadata = EMPTY_METADATA
@@ -246,7 +302,22 @@ class StreamClient:
         self._info: Dict[str, object] = {}
         self._properties: Mapping[str, str] = {}
         self._is_playing: bool = False
-        self._protocol: StreamProtocol = protocol
+        self._protocols: List[StreamProtocol] = protocols
+
+    @property
+    def primary(self) -> StreamProtocol:
+        """Return protocol instance of the primary receiver."""
+        return self._protocols[0]
+
+    @property
+    def rtsp(self) -> RtspSession:
+        """Return RTSP session of the primary receiver."""
+        return self.primary.rtsp
+
+    @property
+    def members(self) -> List[StreamMember]:
+        """Return per-receiver state of all receivers in this session."""
+        return [protocol.member for protocol in self._protocols]
 
     @property
     def listener(self):
@@ -278,7 +349,8 @@ class StreamClient:
 
     def close(self):
         """Close session and free up resources."""
-        self._protocol.teardown()
+        for protocol in self._protocols:
+            protocol.teardown()
         if self.control_client:
             self.control_client.close()
         if self.timing_server:
@@ -303,8 +375,10 @@ class StreamClient:
 
         self._update_output_properties(properties)
 
+        # One control client and one timing server serve all receivers: the very
+        # point is that they all get their timing from one and the same clock
         (_, control_client) = await self.loop.create_datagram_endpoint(
-            lambda: ControlClient(self.context, self._packet_backlog),
+            lambda: ControlClient(self.context, self.members),
             local_addr=(
                 self.rtsp.connection.local_ip,
                 self.settings.protocols.raop.control_port,
@@ -327,15 +401,36 @@ class StreamClient:
             self.timing_server.port,
         )
 
-        self._info.update(await self.rtsp.info())
-        _LOGGER.debug("Updated info parameters to: %s", self.info)
+        # Set up receivers one after the other rather than concurrently. This is a
+        # sender-side choice and not a receiver limitation: the parallel failure seen
+        # while developing this was traced to this code, and an Apple sender opens the
+        # members of a group in parallel routinely. Serial setup is kept because it is
+        # simpler to reason about and costs one extra round trip per member.
+        set_up: List[StreamProtocol] = []
+        try:
+            for protocol in self._protocols:
+                info = await protocol.rtsp.info()
+                if protocol is self.primary:
+                    self._info.update(info)
+                    _LOGGER.debug("Updated info parameters to: %s", self.info)
 
-        # Handle some special authentication cases
-        if self._requires_auth_setup:
-            await self.rtsp.auth_setup()
+                # Handle some special authentication cases
+                if self._requires_auth_setup:
+                    await protocol.rtsp.auth_setup()
 
-        # Set up the streaming session
-        await self._protocol.setup(self.timing_server.port, self.control_client.port)
+                # Set up the streaming session
+                await protocol.setup(self.timing_server.port, self.control_client.port)
+                set_up.append(protocol)
+        except Exception:
+            # Once there is more than one receiver, a later one can fail after an
+            # earlier one has fully set up - the partner is busy, or rebooting, or
+            # rejects the pairing. The receivers that succeeded are holding
+            # sessions, and nothing downstream gives them back: stream_file only
+            # reaches RaopPlaybackManager.teardown(), which closes connections
+            # and never sends TEARDOWN. Do it here, before the error leaves.
+            for done in set_up:
+                await self._teardown_member(done)
+            raise
 
     def _update_output_properties(self, properties: Mapping[str, str]) -> None:
         (
@@ -368,8 +463,9 @@ class StreamClient:
         self._is_playing = False
 
     async def set_volume(self, volume: float) -> None:
-        """Change volume on the receiver."""
-        await self.rtsp.set_parameter("volume", str(volume))
+        """Change volume on the receiver(s)."""
+        for protocol in self._protocols:
+            await protocol.rtsp.set_parameter("volume", str(volume))
         self.context.volume = volume
 
     async def send_audio(  # pylint: disable=too-many-branches
@@ -385,72 +481,87 @@ class StreamClient:
 
         self.context.reset()
 
-        transport = None
         try:
-            # Create a socket used for writing audio packets (ugly)
-            transport, _ = await self.loop.create_datagram_endpoint(
-                AudioProtocol,
-                remote_addr=(self.rtsp.connection.remote_ip, self.context.server_port),
-            )
+            for protocol in self._protocols:
+                member = protocol.member
 
-            # Start sending sync packets
-            self.control_client.start(self.rtsp.connection.remote_ip)
+                # Create a socket used for writing audio packets (ugly)
+                member.transport, _ = await self.loop.create_datagram_endpoint(
+                    AudioProtocol,
+                    remote_addr=(
+                        member.rtsp.connection.remote_ip,
+                        member.server_port,
+                    ),
+                )
 
-            # Send progress if supported by receiver
-            if MetadataType.Progress in self._metadata_types:
-                start = self.context.rtptime
-                now = self.context.rtptime
-                end = start + source.duration * self.context.sample_rate
-                await self.rtsp.set_parameter("progress", f"{start}/{now}/{end}")
+            # Start sending sync packets (to every receiver)
+            self.control_client.start()
 
-            # Apply text metadata if it is supported
             self._metadata = metadata
-            if MetadataType.Text in self._metadata_types:
-                _LOGGER.debug("Playing with metadata: %s", self.playback_info.metadata)
-                await self.rtsp.set_metadata(
-                    self.context.rtsp_session,
-                    self.context.rtpseq,
-                    self.context.rtptime,
-                    self.playback_info.metadata,
-                )
 
-            # Send artwork if that is supported
-            if (
-                MetadataType.Artwork in self._metadata_types
-                and metadata.artwork is not None
-            ):
-                _LOGGER.debug("Sending %s bytes artwork", len(metadata.artwork))
-                await self.rtsp.set_artwork(
-                    self.context.rtsp_session,
-                    self.context.rtpseq,
-                    self.context.rtptime,
-                    metadata.artwork,
-                )
+            for protocol in self._protocols:
+                member = protocol.member
+                rtsp = protocol.rtsp
 
-            # Start keep-alive task to ensure connection is not closed by remote device
-            await self._protocol.start_feedback()
+                # Send progress if supported by receiver
+                if MetadataType.Progress in self._metadata_types:
+                    start = self.context.rtptime
+                    now = self.context.rtptime
+                    end = start + source.duration * self.context.sample_rate
+                    await rtsp.set_parameter("progress", f"{start}/{now}/{end}")
+
+                # Apply text metadata if it is supported
+                if MetadataType.Text in self._metadata_types:
+                    _LOGGER.debug(
+                        "Playing with metadata: %s", self.playback_info.metadata
+                    )
+                    await rtsp.set_metadata(
+                        member.rtsp_session,
+                        self.context.rtpseq,
+                        self.context.rtptime,
+                        self.playback_info.metadata,
+                    )
+
+                # Send artwork if that is supported
+                if (
+                    MetadataType.Artwork in self._metadata_types
+                    and metadata.artwork is not None
+                ):
+                    _LOGGER.debug("Sending %s bytes artwork", len(metadata.artwork))
+                    await rtsp.set_artwork(
+                        member.rtsp_session,
+                        self.context.rtpseq,
+                        self.context.rtptime,
+                        metadata.artwork,
+                    )
+
+                # Start keep-alive task to ensure connection is not closed by
+                # remote device
+                await protocol.start_feedback()
 
             listener = self.listener
             if listener:
                 listener.playing(self.playback_info)
 
-            # Start playback
-            await self.rtsp.record()
+            # Start playback. All receivers are anchored to the same point of the
+            # same timeline, which is what keeps them playing in sync.
+            for protocol in self._protocols:
+                await protocol.rtsp.record()
 
-            await self.rtsp.flush(
-                headers={
-                    "Range": "npt=0-",
-                    "Session": self.context.rtsp_session,
-                    "RTP-Info": (
-                        f"seq={self.context.rtpseq};rtptime={self.context.rtptime}"
-                    ),
-                }
-            )
+                await protocol.rtsp.flush(
+                    headers={
+                        "Range": "npt=0-",
+                        "Session": protocol.member.rtsp_session,
+                        "RTP-Info": (
+                            f"seq={self.context.rtpseq};rtptime={self.context.rtptime}"
+                        ),
+                    }
+                )
 
             if volume:
                 await self.set_volume(pct_to_dbfs(volume))
 
-            await self._stream_data(source, transport)
+            await self._stream_data(source)
         except (  # pylint: disable=try-except-raise
             exceptions.ProtocolError,
             exceptions.AuthenticationError,
@@ -459,22 +570,49 @@ class StreamClient:
         except Exception as ex:
             raise exceptions.ProtocolError("an error occurred during streaming") from ex
         finally:
-            self._packet_backlog.clear()  # Don't keep old packets around (big!)
-            if transport:
-                # TODO: Teardown should not be done here. In fact, nothing should be
-                # closed here since the connection should be reusable for streaming
-                # more audio files. Refactor when support for that is added.
-                await self.rtsp.teardown(self.context.rtsp_session)
-                transport.close()
-            self._protocol.teardown()
+            for protocol in self._protocols:
+                await self._teardown_member(protocol)
             self.close()
 
             listener = self.listener
             if listener:
                 listener.stopped()
 
+    async def _teardown_member(self, protocol: StreamProtocol) -> None:
+        """Tear down the session of one receiver.
+
+        Errors are logged rather than raised: one receiver failing to tear down
+        must not leave another receiver with a session that is never torn down,
+        as that leaves a speaker stuck until it is restarted.
+        """
+        member = protocol.member
+        member.packet_backlog.clear()  # Don't keep old packets around (big!)
+        try:
+            # TODO: Teardown should not be done here. In fact, nothing should be
+            # closed here since the connection should be reusable for streaming
+            # more audio files. Refactor when support for that is added.
+            #
+            # The TEARDOWN is not conditional on the transport: setup() is what
+            # makes the receiver hold a session, and the transport is only
+            # created later, when audio starts. Sending it only when there was a
+            # transport meant that anything failing in between - a busy partner, an
+            # authentication error, a receiver rebooting - left a receiver
+            # holding a session that nothing ever gave back, which keeps a
+            # speaker out of service until it is restarted.
+            await member.rtsp.teardown(member.rtsp_session)
+            if member.transport:
+                member.transport.close()
+                member.transport = None
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.exception(
+                "Failed to tear down session with %s",
+                member.rtsp.connection.remote_ip,
+            )
+        finally:
+            protocol.teardown()
+
     async def _stream_data(  # pylint: disable=too-many-locals
-        self, source: AudioSource, transport
+        self, source: AudioSource
     ):
         stats = Statistics(self.context.sample_rate)
 
@@ -485,9 +623,7 @@ class StreamClient:
         while self._is_playing:
             current_seqno = self.context.rtpseq - 1
 
-            num_sent = await self._send_packet(
-                source, stats.total_frames == 0, transport
-            )
+            num_sent = await self._send_packet(source, stats.total_frames == 0)
             if num_sent == 0:
                 break
 
@@ -505,7 +641,7 @@ class StreamClient:
                     frames_behind,
                 )
                 num_sent, has_more_packets = await self._send_number_of_packets(
-                    source, transport, max_packets
+                    source, max_packets
                 )
                 stats.tick(num_sent)
                 if not has_more_packets:
@@ -557,9 +693,7 @@ class StreamClient:
             (monotonic_ns() - stats.start_time_ns) / 10**9,
         )
 
-    async def _send_packet(
-        self, source: AudioSource, first_packet: bool, transport
-    ) -> int:
+    async def _send_packet(self, source: AudioSource, first_packet: bool) -> int:
         # Once all frames in the audio stream have been sent, we are still "latency"
         # behind and will start sending padding (empty audio) until we catch up. This
         # is needed to keep the sync packets in line with real time.
@@ -583,20 +717,31 @@ class StreamClient:
             0xE0 if first_packet else 0x60,
             self.context.rtpseq,
             self.context.rtptime,
-            self.rtsp.session_id,
+            self.context.ssrc,
         )
 
         audio = frames
 
-        if transport.is_closing():
+        # Same header and same audio to every receiver, but each receiver has its
+        # own transport and its own backlog (the packets differ as they are
+        # encrypted with receiver specific keys)
+        packet_sent = False
+        for protocol in self._protocols:
+            member = protocol.member
+            transport = member.transport
+            if transport is None or transport.is_closing():
+                continue
+
+            # Send packet and add it to backlog
+            rtpseq, packet = await protocol.send_audio_packet(transport, header, audio)
+            member.packet_backlog[rtpseq] = packet
+            packet_sent = True
+
+        # Losing one receiver should not stop the others, but when no receiver is
+        # left there is nothing more to do
+        if not packet_sent:
             _LOGGER.warning("Connection closed while streaming audio")
             return 0
-
-        # Send packet and add it to backlog
-        rtpseq, packet = await self._protocol.send_audio_packet(
-            transport, header, audio
-        )
-        self._packet_backlog[rtpseq] = packet
 
         self.context.rtpseq = (self.context.rtpseq + 1) % (2**16)
         self.context.head_ts += int(len(frames) / self.context.frame_size)
@@ -604,7 +749,7 @@ class StreamClient:
         return int(len(frames) / self.context.frame_size)
 
     async def _send_number_of_packets(
-        self, source: AudioSource, transport, count: int
+        self, source: AudioSource, count: int
     ) -> Tuple[int, bool]:
         """Send a specific number of packets.
 
@@ -612,7 +757,7 @@ class StreamClient:
         """
         total_frames = 0
         for _ in range(count):
-            sent = await self._send_packet(source, False, transport)
+            sent = await self._send_packet(source, False)
             total_frames += sent
             if sent == 0:
                 return total_frames, False

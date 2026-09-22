@@ -56,6 +56,13 @@ class Response(typing.NamedTuple):
 
 DEVICE_INFO_SERVICE = "_device-info._tcp.local"
 
+# Types a scan always asks for and that can never come back with an endpoint, so their
+# absence never means a host still owes us an answer. `_device-info` is a TXT-only
+# record with no SRV, and an ordinary device never answers for `_sleep-proxy` at all.
+# Without this, every host that answered in full would still look like it was holding
+# two types back, and would be asked for them once a second for the whole scan.
+NEVER_RESOLVED_SERVICES = (DEVICE_INFO_SERVICE, SLEEP_PROXY_SERVICE)
+
 
 def decode_value(value: bytes):
     """Decode a bytes value and convert non-breaking-spaces.
@@ -342,7 +349,11 @@ class MulticastDnsSdClientProtocol:  # pylint: disable=too-many-instance-attribu
         self.end_condition = end_condition or (lambda _: False)
         self.semaphore: asyncio.Semaphore = asyncio.Semaphore(value=0)
         self.parser = ServiceParser()
-        self._unicasts: typing.Dict[IPv4Address, typing.List[bytes]] = {}
+        # Instance-scoped ANY queries for devices a sleep proxy answered for.
+        self._unicasts: typing.Dict[str, typing.List[bytes]] = {}
+        # Type-scoped PTR queries for types a host that is plainly awake has not
+        # answered for. Separate from `_unicasts` because one host can need both.
+        self._type_queries: typing.Dict[str, typing.List[bytes]] = {}
         self._task: typing.Optional[asyncio.Future] = None
         self._receivers: typing.List[asyncio.BaseProtocol] = []
 
@@ -394,8 +405,11 @@ class MulticastDnsSdClientProtocol:  # pylint: disable=too-many-instance-attribu
 
                 self._sendto(query, (self.address, self.port))
 
-            # Send unicast requests if devices are sleeping
-            for address, queries in self._unicasts.items():
+            # Sleeping devices, and hosts that owe us a type they never answered for.
+            for address, queries in [
+                *self._unicasts.items(),
+                *self._type_queries.items(),
+            ]:
                 for query in queries:
                     log_binary(
                         _LOGGER,
@@ -458,18 +472,75 @@ class MulticastDnsSdClientProtocol:  # pylint: disable=too-many-instance-attribu
                 [service.name + "." + service.type for service in services],
                 QueryType.ANY,
             )
-        elif query_resp.count >= len(self.queries):
-            response = Response(
-                services=query_resp.parser.parse(),
-                deep_sleep=query_resp.deep_sleep,
-                model=_get_model(query_resp.parser.parse()),
-            )
+        else:
+            self._ask_host_for_missing_services(addr[0], query_resp.parser)
 
-            if self.end_condition(response):
-                # Matches end condition: replace everything found so far and abort
-                self.query_responses = {addr[0]: self.query_responses[addr[0]]}
-                self.semaphore.release()
-                self.close()
+            if query_resp.count >= len(self.queries):
+                response = Response(
+                    services=query_resp.parser.parse(),
+                    deep_sleep=query_resp.deep_sleep,
+                    model=_get_model(query_resp.parser.parse()),
+                )
+
+                if self.end_condition(response):
+                    # Matches end condition: replace everything found so far and abort
+                    self.query_responses = {addr[0]: self.query_responses[addr[0]]}
+                    self.semaphore.release()
+                    self.close()
+
+    def _ask_host_for_missing_services(
+        self, address: str, parser: ServiceParser
+    ) -> None:
+        """Ask a host directly for the service types it has not answered for.
+
+        A multicast scan asks the network at large for PTRs and takes whatever turns
+        up before the timeout. A speaker can answer for one type and stay silent on
+        another for seconds at a time, so a short window can hold a device's records
+        for one protocol and nothing at all for another: it is plainly awake and
+        reachable, yet comes back missing a protocol, which also changes the
+        identifier it is found by. Asking that host directly is what resolves it.
+
+        Why it goes quiet is not established here. What is measured is that it does,
+        and that the host answers a direct question for the same type immediately.
+
+        These queries are kept apart from the ones sent to sleeping devices rather
+        than replacing them: a sleep proxy answering for a sleeping device is often a
+        device in its own right, and its instance-scoped follow-up is the only thing
+        that resolves the device it proxies for. Both sets are retried by the resend
+        loop, and both are also sent straight away, because the loop only comes round
+        once a second and a host first heard in the final second would otherwise
+        never be asked at all.
+        """
+        resolved = {
+            service.type
+            for service in parser.parse()
+            if service.address is not None and service.port != 0
+        }
+        missing = [
+            service
+            for service in self.services
+            if service not in resolved and service not in NEVER_RESOLVED_SERVICES
+        ]
+
+        # A host answering in full asks for nothing, and a chatty one is not asked
+        # again until what it still owes us changes.
+        queries = create_service_queries(missing, QueryType.PTR)
+        if queries == self._type_queries.get(address):
+            return
+
+        if not queries:
+            self._type_queries.pop(address, None)
+            return
+
+        self._type_queries[address] = queries
+        for query in queries:
+            log_binary(
+                _LOGGER,
+                f"Sending direct DNS request to {address}:{self.port}",
+                level=TRAFFIC_LEVEL,
+                Data=query,
+            )
+            self._sendto(query, (address, self.port))
 
     @staticmethod
     def error_received(exc) -> None:

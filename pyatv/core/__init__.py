@@ -18,7 +18,7 @@ from typing import (
 
 from pyatv.const import FeatureName, PairingRequirement, Protocol
 from pyatv.core.protocol import MessageDispatcher
-from pyatv.interface import BaseConfig, BaseService, Playing, PushUpdater
+from pyatv.interface import BaseConfig, BaseService, Playing, PushUpdater, Storage
 from pyatv.settings import Settings
 from pyatv.support.http import ClientSessionManager, create_session
 from pyatv.support.state_producer import StateProducer
@@ -135,6 +135,17 @@ class MutableService(BaseService):
         self._requires_password = False
         self._pairing_requirement = PairingRequirement.Unsupported
 
+        # Address ("host" or "host:port") of a second receiver this service also
+        # drives: the other half of a stereo pair, filled in by scanning when two
+        # addresses turn out to be one device. Not a zeroconf property, as it is
+        # derived from comparing what several addresses advertised.
+        self.stereo_pair_address: Optional[str] = None
+
+        # Identifier of that same second receiver. It travels with the address
+        # because credentials are stored per device and keyed by identifier: a
+        # half that has been paired on its own can only be looked up by this.
+        self.stereo_pair_identifier: Optional[str] = None
+
     @property
     def requires_password(self) -> bool:
         """Return if a password is required to access service."""
@@ -168,6 +179,8 @@ class MutableService(BaseService):
         )
         copy.pairing = self.pairing
         copy.requires_password = self.requires_password
+        copy.stereo_pair_address = self.stereo_pair_address
+        copy.stereo_pair_identifier = self.stereo_pair_identifier
         return copy
 
 
@@ -222,6 +235,7 @@ class Core:
         session_manager: ClientSessionManager,
         takeover: TakeoverMethod,
         state_dispatcher: ProtocolStateDispatcher,
+        storage: Storage,
     ) -> None:
         """Initialize a new Core instance."""
         self.loop = loop
@@ -233,11 +247,18 @@ class Core:
         self.takeover = takeover
         self.state_dispatcher = state_dispatcher
 
+        # Settings of *this* device are in "settings" above. Storage is here for the
+        # rare case where a protocol needs the settings of another device: streaming
+        # to the other half of a stereo pair needs that half's credentials, and
+        # credentials are stored per device, keyed by identifier.
+        self.storage = storage
+
 
 async def create_core(
     config: BaseConfig,
     service: BaseService,
     /,
+    storage: Storage,
     settings: Optional[Settings] = None,
     device_listener: Optional[StateProducer] = None,
     session_manager: Optional[ClientSessionManager] = None,
@@ -264,6 +285,7 @@ async def create_core(
         ProtocolStateDispatcher(
             service.protocol, core_dispatcher or CoreStateDispatcher()
         ),
+        storage,
     )
 
 

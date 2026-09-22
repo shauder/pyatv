@@ -5,7 +5,7 @@ from ipaddress import IPv4Address
 from itertools import chain
 import logging
 import struct
-from typing import Dict, List, Mapping, NamedTuple, Optional, Tuple, Union, cast
+from typing import Dict, List, Mapping, NamedTuple, Optional, Set, Tuple, Union, cast
 from unittest.mock import patch
 
 from pyatv.core import mdns
@@ -183,6 +183,7 @@ def create_response(
     services: Dict[str, FakeDnsService],
     ip_filter: Optional[str] = None,
     sleep_proxy: bool = False,
+    silent_services: Optional[Set[str]] = None,
 ):
     msg = dns.DnsMessage().unpack(request)
 
@@ -190,7 +191,23 @@ def create_response(
     resp.flags = 0x0840
     resp.questions = msg.questions
 
+    # A device that says nothing at all about a type while it is being scanned for
+    # alongside others, and answers once that type is asked for on its own. This is
+    # how the sleepiest speakers behave: they do not half-answer, they go quiet.
+    withheld: Set[str] = set()
+    if silent_services:
+        asked = {
+            question.qname
+            for question in msg.questions
+            if question.qname != mdns.SLEEP_PROXY_SERVICE
+        }
+        if not asked.issubset(silent_services):
+            withheld = silent_services
+
     for question in resp.questions:
+        if question.qname in withheld:
+            continue
+
         service, full_name = _lookup_service(question, services)
         if service is None or (ip_filter and ip_filter not in service.addresses):
             continue
@@ -245,6 +262,7 @@ class FakeUdns(asyncio.Protocol):
         self.skip_count: int = 0  # Ignore sending response to this many requests
         self.ip_filter = None
         self.sleep_proxy: bool = False
+        self.silent_services: Set[str] = set()
         self.request_count: int = 0
 
     async def start(self):
@@ -275,7 +293,9 @@ class FakeUdns(asyncio.Protocol):
             self.skip_count -= 1
             return
 
-        resp = create_response(data, self.services, self.ip_filter, self.sleep_proxy)
+        resp = create_response(
+            data, self.services, self.ip_filter, self.sleep_proxy, self.silent_services
+        )
         self.transport.sendto(resp.pack(), addr)
         self.request_count += 1
 

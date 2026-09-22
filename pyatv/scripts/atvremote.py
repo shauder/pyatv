@@ -74,6 +74,12 @@ async def _scan_for_device(args, timeout, storage: Storage, loop, protocol=None)
         _LOGGER.error("Could not find any Apple TV on current network")
         return None
 
+    if not devices:
+        # Something was found, just not under that name. Reachable now that a
+        # stereo pair is one device, listed under one of the two halves' names.
+        _LOGGER.error("Could not find any Apple TV named %s", args.name)
+        return None
+
     if len(devices) > 1:
         _LOGGER.error("Found more than one Apple TV; specify one using --id")
         _print_found_apple_tvs(devices, sys.stderr)

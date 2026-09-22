@@ -5,17 +5,37 @@ import asyncio
 import logging
 from random import randrange
 from typing import Optional, Tuple
+from uuid import uuid4
 
 from pyatv.auth.hap_pairing import NO_CREDENTIALS, HapCredentials
 from pyatv.protocols.raop import timing
+from pyatv.protocols.raop.fifo import PacketFifo
 from pyatv.protocols.raop.packets import TimingPacket
-from pyatv.support.rtsp import FRAMES_PER_PACKET
+from pyatv.support.rtsp import FRAMES_PER_PACKET, RtspSession
 
 _LOGGER = logging.getLogger(__name__)
 
+# We should store this many packets in case retransmission is requested
+PACKET_BACKLOG_SIZE = 1000
+
+
+def new_group_uuid() -> str:
+    """Return an identifier for a new playback group.
+
+    It is random (i.e. a version 4 UUID) by design: a receiver derives the ids of
+    the groups it forms itself from names (version 5), so the version is what
+    distinguishes a group set up by a sender from one a receiver made up.
+    """
+    return str(uuid4()).upper()
+
 
 class StreamContext:
-    """Data used for one RAOP session."""
+    """Data shared by all receivers in one RAOP session.
+
+    Everything here defines *what* is streamed and *when*: the audio format and
+    the RTP timeline. It is deliberately receiver agnostic, so that several
+    receivers can be fed from one timeline (see :class:`StreamMember`).
+    """
 
     def __init__(self) -> None:
         """Initialize a new StreamContext."""
@@ -32,11 +52,10 @@ class StreamContext:
         self.head_ts = 0
         self.padding_sent: int = 0
 
-        self.server_port: int = 0
         self.event_port: int = 0
-        self.control_port: int = 0
-        self.timing_port: int = 0
-        self.rtsp_session: int = 0
+
+        self.ssrc: int = 0
+        self.group_uuid: Optional[str] = None
 
         self.volume: Optional[float] = None
 
@@ -73,8 +92,55 @@ class StreamContext:
         return FRAMES_PER_PACKET * self.frame_size
 
 
+class StreamMember:
+    """State belonging to one single receiver in a RAOP session.
+
+    One member corresponds to one receiver: its own RTSP session, the ports that
+    receiver picked, its own audio transport and its own retransmit backlog. None
+    of this can be shared between receivers, as opposed to the timeline in
+    :class:`StreamContext`.
+    """
+
+    def __init__(self, rtsp: RtspSession) -> None:
+        """Initialize a new StreamMember."""
+        self.rtsp: RtspSession = rtsp
+
+        self.server_port: int = 0
+        self.control_port: int = 0
+        self.timing_port: int = 0
+        self.rtsp_session: int = 0
+
+        self.transport: Optional[asyncio.DatagramTransport] = None
+        self.packet_backlog: PacketFifo = PacketFifo(PACKET_BACKLOG_SIZE)
+
+
 class StreamProtocol(ABC):
     """Base interface for a streaming protocol."""
+
+    def __init__(
+        self,
+        context: StreamContext,
+        rtsp: RtspSession,
+        credentials: Optional[HapCredentials] = None,
+    ) -> None:
+        """Initialize a new StreamProtocol instance.
+
+        Credentials are the session's unless this receiver brought its own. The
+        other half of a stereo pair is a device in its own right: when it has been
+        paired, it is verified with the pairing made with *it* and not with the
+        one made with the device the session belongs to.
+        """
+        self.context: StreamContext = context
+        self.rtsp: RtspSession = rtsp
+        self.member: StreamMember = StreamMember(rtsp)
+        self._credentials: Optional[HapCredentials] = credentials
+
+    @property
+    def credentials(self) -> HapCredentials:
+        """Return credentials this receiver is verified with."""
+        if self._credentials is None:
+            return self.context.credentials
+        return self._credentials
 
     @abstractmethod
     async def setup(self, timing_server_port: int, control_client_port: int) -> None:

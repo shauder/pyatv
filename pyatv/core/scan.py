@@ -11,6 +11,7 @@ from typing import (
     Any,
     Awaitable,
     Callable,
+    Collection,
     Dict,
     Generator,
     List,
@@ -59,6 +60,15 @@ DEVICE_INFO: str = "_device-info._tcp.local"
 DEVICE_INFO_TYPE: str = f"{DEVICE_INFO}."
 SLEEP_PROXY: str = "_sleep-proxy._udp.local"
 SLEEP_PROXY_TYPE: str = f"{SLEEP_PROXY}."
+AIRPLAY: str = "_airplay._tcp.local"
+RAOP: str = "_raop._tcp.local"
+
+# Tight-sync identifier: the same value on both halves of a stereo pair
+TIGHT_SYNC_ID: str = "tsid"
+
+# A HomeKit public key in the RAOP record is the same key the AirPlay record
+# carries: a speaker announcing it has an AirPlay record. AirPlay 1 has neither.
+HOMEKIT_PUBLIC_KEY: str = "pk"
 
 # These ports have been "arbitrarily" chosen (see issue #580) because a device normally
 # listen on them (more or less). They are used as best-effort when for unicast scanning
@@ -94,6 +104,125 @@ def get_unique_identifiers(
         unique_id = get_unique_id(service.type, service.name, service.properties)
         if unique_id:
             yield unique_id
+
+
+def fold_stereo_pairs(configs: List[BaseConfig]) -> List[BaseConfig]:
+    """Fold the two halves of a stereo pair into a single configuration.
+
+    Two speakers bonded as a stereo pair advertise the same tight-sync identifier
+    ("tsid") in their AirPlay TXT record: they share one volume, split one stereo
+    image between them and are one device in HomeKit. They are therefore returned
+    as one configuration, with the other half's address attached to the surviving
+    half's RAOP service so that streaming drives both.
+
+    Nothing but "tsid" is used for this. The group a receiver is currently in
+    ("gid") and the leader flags change from session to session - a pair that is
+    streaming, or that was left split, can have both halves calling themselves a
+    leader - so nothing else is stable enough to say that two addresses are one
+    device. A room ("gpn") is not a device at all: it can hold several independent
+    speakers and pairs, and those stay separate configurations.
+
+    Only the AirPlay record ever says any of this, and it does not always arrive
+    inside a scan window. A half that answered without it looks exactly like a
+    speaker that is not in a pair and is handed back on its own, which is what
+    warn_about_missing_airplay_records is for.
+    """
+    halves_by_tsid: Dict[str, List[BaseConfig]] = {}
+    for config in configs:
+        tsid = config.properties.get(AIRPLAY, {}).get(TIGHT_SYNC_ID)
+        if tsid and config.get_service(Protocol.RAOP):
+            halves_by_tsid.setdefault(tsid, []).append(config)
+
+    folded_away: Set[int] = set()
+    for tsid, halves in halves_by_tsid.items():
+        # A stereo pair is exactly two speakers, and that is a scope decision rather
+        # than a limitation to apologise for: two is what AirPlay pairs today, and
+        # anything larger sharing one tight-sync id would be multi-channel audio,
+        # which needs a channel per speaker rather than a stereo stream sent to both.
+        # So one half alone - its partner switched off, or missed by this scan - keeps
+        # working on its own, and more than two is left alone rather than guessed at.
+        if len(halves) != 2:
+            _LOGGER.debug(
+                "Stereo pair %s: not folding, %d halves answered", tsid, len(halves)
+            )
+            continue
+
+        # An identifier is what a user types and what storage keys credentials by,
+        # so a pair is folded into one of the halves instead of being given an
+        # identity of its own, and that half is picked by something that does not
+        # move: the lower identifier. Which half leads does move, per session.
+        primary, partner = sorted(halves, key=lambda config: config.identifier or "")
+
+        # Two halves are two devices. One speaker answering at two addresses is
+        # not: a stale A record lives in the zeroconf cache beside the new one for
+        # a while after DHCP moves a receiver, and for that window one HomePod is
+        # two configurations with one identifier. Folding those together would
+        # open two sessions to the same receiver and let scan order pick which of
+        # the two addresses - one of them dead - the caller is handed.
+        if not primary.identifier or primary.identifier == partner.identifier:
+            continue
+
+        service = primary.get_service(Protocol.RAOP)
+        partner_service = partner.get_service(Protocol.RAOP)
+        if not isinstance(service, MutableService) or partner_service is None:
+            continue
+
+        # The identifier travels with the address because it is the only thing the
+        # other half's own credentials can be looked up by, and whether there are
+        # any cannot be known here: scanning has no storage. Connecting does.
+        service.stereo_pair_address = f"{partner.address}:{partner_service.port}"
+        service.stereo_pair_identifier = partner_service.identifier
+        folded_away.add(id(partner))
+        _LOGGER.debug(
+            "Stereo pair %s: folded %s into %s", tsid, partner.address, primary.address
+        )
+
+    return [config for config in configs if id(config) not in folded_away]
+
+
+def warn_about_missing_airplay_records(
+    configs: List[BaseConfig], scanned_types: Collection[str]
+) -> None:
+    """Warn about AirPlay 2 speakers answering without their AirPlay record.
+
+    A speaker whose AirPlay record did not arrive is still returned, on what its
+    RAOP record alone says, and that is a quietly different answer. It comes back
+    under its RAOP identifier rather than its AirPlay one, so asking for it by the
+    identifier an earlier scan printed finds nothing; and if it is half of a
+    stereo pair there is no tsid left to fold the pair on, so streaming to it
+    plays half a stereo image. A caller can see neither, so this is said rather than
+    quietly delivered.
+
+    A multicast scan asks the host directly for a type it never answered for, which
+    removed this on every network it has been measured on. It cannot cover every
+    scanner: a zeroconf-backed scan builds its follow-up from instances already known
+    by PTR, and a speaker that went silent on a type has no PTR to build from. So the
+    warning stays, for the scans the follow-up does not reach.
+
+    The public key in the RAOP record is what says a record is missing at all: an
+    AirPlay 2 speaker announces both records and repeats the key in each, while an
+    AirPlay 1 speaker announces RAOP alone and has nothing to miss.
+    """
+    # A scan that did not ask for AirPlay records, as pyatv.scan(protocol=...)
+    # allows, did not miss any.
+    if AIRPLAY not in scanned_types:
+        return
+
+    for config in configs:
+        if config.properties.get(AIRPLAY):
+            continue
+        if HOMEKIT_PUBLIC_KEY not in config.properties.get(RAOP, {}):
+            continue
+        _LOGGER.warning(
+            "%s (%s) answered on RAOP but its AirPlay record did not arrive in "
+            "this scan: it is returned as %s, and a stereo pair it belongs to "
+            "cannot be recognized and would play split. A multicast scan asks the "
+            "host for the missing record; this scanner does not, so pass aiozc=None "
+            "to use one that does.",
+            config.name,
+            config.address,
+            config.identifier,
+        )
 
 
 def _empty_handler(service: mdns.Service, response: mdns.Response) -> None:
@@ -316,8 +445,17 @@ class MulticastMdnsScanner(BaseScanner):
             self.handle_response(response)
 
     def _end_if_identifier_found(self, response: mdns.Response):
-        return self.identifier and not self.identifier.isdisjoint(
+        if self.identifier is None or self.identifier.isdisjoint(
             set(get_unique_identifiers(response))
+        ):
+            return False
+
+        # Ending here throws away every other response, so a half of a stereo pair
+        # must not end it: the other half answers under an identifier of its own
+        # and there would be nothing left to fold it into. Keep listening and let
+        # the timeout finish the scan.
+        return not any(
+            service.properties.get(TIGHT_SYNC_ID) for service in response.services
         )
 
 

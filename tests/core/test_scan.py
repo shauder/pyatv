@@ -1,6 +1,9 @@
 """Unit tests for scan module."""
 
 import asyncio
+from ipaddress import IPv4Address
+import logging
+from typing import Mapping, Optional
 from unittest.mock import patch
 
 import pytest
@@ -18,9 +21,9 @@ from zeroconf.asyncio import AsyncServiceBrowser, AsyncZeroconf
 
 from pyatv import scan
 from pyatv.conf import AppleTV
-from pyatv.const import DeviceModel
+from pyatv.const import DeviceModel, Protocol
 from pyatv.core.mdns import Response, Service
-from pyatv.core.scan import get_unique_identifiers
+from pyatv.core.scan import MulticastMdnsScanner, get_unique_identifiers
 
 TEST_SERVICE1 = Service("_service1._tcp.local", "service1", None, 0, {"a": "b"})
 TEST_SERVICE2 = Service("_service2._tcp.local", "service2", None, 0, {"c": "d"})
@@ -395,3 +398,417 @@ async def test_scan_with_zeroconf_unicast_not_found():
     assert not results
     await browser.async_cancel()
     await aiozc.async_close()
+
+
+# A stereo pair is two addresses advertising the same tight-sync id ("tsid"). The
+# halves below are named after the way a pair is usually set up, but a name never
+# says anything about a pair: only tsid does.
+
+PAIR_TSID = "0D4B3C2A-1F5E-5B8A-9C7D-6E2F4A8B1C30"
+OTHER_TSID = "7A1E9C4B-2D6F-5A3E-8B0C-1F5D7E9A2B44"
+
+LEFT_ID = "AA:BB:CC:DD:EE:01"
+RIGHT_ID = "AA:BB:CC:DD:EE:02"
+LEFT_ADDRESS = "192.168.107.10"
+RIGHT_ADDRESS = "192.168.107.11"
+LEFT_PORT = 7000
+RIGHT_PORT = 7001
+
+# A RAOP record names itself with the same identifier stripped of its colons, so
+# one speaker answers to two forms of it and which one a configuration comes back
+# under depends on which of its records arrived.
+LEFT_RAOP_ID = LEFT_ID.replace(":", "")
+RIGHT_RAOP_ID = RIGHT_ID.replace(":", "")
+
+# What the RAOP record of an AirPlay 2 speaker says: a model, the codecs and the
+# public key it repeats from its AirPlay record. There is no grouping key of any
+# kind in it, which is why a half that answered with this record alone cannot be
+# folded into anything. An AirPlay 1 speaker announces no public key and no
+# AirPlay record either, so nothing is missing when it answers on RAOP alone.
+RAOP_AIRPLAY_2 = {"am": "AudioAccessory5,1", "cn": "0,1", "pk": 64 * "a"}
+RAOP_AIRPLAY_1 = {"am": "AirPort10,115", "cn": "0,1"}
+
+
+def _txt_record(properties: Mapping[str, str]) -> bytes:
+    """Encode properties the way a TXT record carries them."""
+    return b"".join(
+        bytes([len(entry)]) + entry
+        for entry in (f"{k}={v}".encode("utf-8") for k, v in properties.items())
+    )
+
+
+def _speaker_records(
+    name: str,
+    identifier: str,
+    address: str,
+    port: int,
+    tsid: Optional[str] = None,
+    group: Optional[Mapping[str, str]] = None,
+    airplay: bool = True,
+    raop_properties: Mapping[str, str] = RAOP_AIRPLAY_2,
+):
+    """Return the records one AirPlay speaker announces.
+
+    With airplay=False it announces only its RAOP record, which is what a speaker
+    looks like when its AirPlay record did not arrive inside the scan window.
+    """
+    airplay_name = f"{name}._airplay._tcp.local."
+    raop_name = f"{identifier.replace(':', '')}@{name}._raop._tcp.local."
+    properties = {"deviceid": identifier, **(group or {})}
+    if tsid:
+        properties["tsid"] = tsid
+
+    airplay_records = [
+        DNSPointer(
+            "_airplay._tcp.local.",
+            const._TYPE_PTR,
+            const._CLASS_IN,
+            const._DNS_OTHER_TTL,
+            airplay_name,
+        ),
+        DNSService(
+            airplay_name,
+            const._TYPE_SRV,
+            const._CLASS_IN,
+            const._DNS_HOST_TTL,
+            0,
+            0,
+            port,
+            f"{name}.local.",
+        ),
+        DNSText(
+            airplay_name,
+            const._TYPE_TXT,
+            const._CLASS_IN,
+            const._DNS_OTHER_TTL,
+            _txt_record(properties),
+        ),
+    ]
+
+    return [
+        DNSAddress(
+            f"{name}.local.",
+            const._TYPE_A,
+            const._CLASS_IN,
+            const._DNS_HOST_TTL,
+            IPv4Address(address).packed,
+        ),
+        *(airplay_records if airplay else []),
+        DNSPointer(
+            "_raop._tcp.local.",
+            const._TYPE_PTR,
+            const._CLASS_IN,
+            const._DNS_OTHER_TTL,
+            raop_name,
+        ),
+        DNSService(
+            raop_name,
+            const._TYPE_SRV,
+            const._CLASS_IN,
+            const._DNS_HOST_TTL,
+            0,
+            0,
+            port,
+            f"{name}.local.",
+        ),
+        DNSText(
+            raop_name,
+            const._TYPE_TXT,
+            const._CLASS_IN,
+            const._DNS_OTHER_TTL,
+            _txt_record(raop_properties),
+        ),
+    ]
+
+
+def _left(tsid: Optional[str] = PAIR_TSID, **kwargs):
+    return _speaker_records(
+        "OfficeLeft", LEFT_ID, LEFT_ADDRESS, LEFT_PORT, tsid, **kwargs
+    )
+
+
+def _right(tsid: Optional[str] = PAIR_TSID, **kwargs):
+    return _speaker_records(
+        "OfficeRight", RIGHT_ID, RIGHT_ADDRESS, RIGHT_PORT, tsid, **kwargs
+    )
+
+
+async def _scan_records(records, **kwargs):
+    aiozc, browser = await _create_zc_with_cache(records)
+    try:
+        return await scan(asyncio.get_event_loop(), timeout=0, aiozc=aiozc, **kwargs)
+    finally:
+        await browser.async_cancel()
+        await aiozc.async_close()
+
+
+@pytest.mark.asyncio
+async def test_scan_folds_stereo_pair_into_one_config():
+    results = await _scan_records([*_left(), *_right()])
+
+    assert len(results) == 1
+
+    # Folded into an identifier that already exists (and the one that does not
+    # depend on which half is currently leading), so nothing a user typed or that
+    # storage keyed credentials by changes meaning
+    atv = results[0]
+    assert atv.identifier == LEFT_ID
+    assert atv.address == IPv4Address(LEFT_ADDRESS)
+
+    # ...carrying the other half, so streaming drives both
+    assert (
+        atv.get_service(Protocol.RAOP).stereo_pair_address
+        == f"{RIGHT_ADDRESS}:{RIGHT_PORT}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_scan_folds_a_pair_named_by_address():
+    # Scanning by address takes a different scanner from scanning the network at
+    # large, and it is the form that matters most for a pair: it is what the
+    # documentation tells a caller to use for a pair a broadcast scan did not
+    # recognize, and the only form that works where multicast does not traverse.
+    # Every other folding test here goes through the multicast scanner, so the
+    # by-address path had no grouping coverage of its own.
+    results = await _scan_records(
+        [*_left(), *_right()], hosts=[LEFT_ADDRESS, RIGHT_ADDRESS]
+    )
+
+    assert len(results) == 1
+    assert results[0].identifier == LEFT_ID
+    assert (
+        results[0].get_service(Protocol.RAOP).stereo_pair_address
+        == f"{RIGHT_ADDRESS}:{RIGHT_PORT}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_scan_carries_the_other_half_identifier():
+    # Whether the other half has credentials of its own cannot be known here:
+    # scanning has no storage. Its identifier is carried along with its address so
+    # that connecting, which does have storage, can look them up.
+    results = await _scan_records([*_left(), *_right()])
+
+    assert results[0].get_service(Protocol.RAOP).stereo_pair_identifier == RIGHT_RAOP_ID
+
+    # ...and that is the identifier the half answers to on its own, i.e. the one
+    # pairing it stores its RAOP credentials against
+    alone = await _scan_records([*_left(), *_right()], identifier=RIGHT_ID)
+
+    assert alone[0].get_service(Protocol.RAOP).identifier == RIGHT_RAOP_ID
+
+
+@pytest.mark.asyncio
+async def test_scan_does_not_fold_half_without_partner():
+    results = await _scan_records(_left())
+
+    assert len(results) == 1
+    assert results[0].identifier == LEFT_ID
+    assert results[0].get_service(Protocol.RAOP).stereo_pair_address is None
+
+
+@pytest.mark.asyncio
+async def test_scan_does_not_fold_different_tight_sync_ids():
+    results = await _scan_records([*_left(), *_right(tsid=OTHER_TSID)])
+
+    assert len(results) == 2
+    assert all(
+        atv.get_service(Protocol.RAOP).stereo_pair_address is None for atv in results
+    )
+
+
+@pytest.mark.asyncio
+async def test_scan_does_not_fold_speakers_without_tight_sync_id():
+    results = await _scan_records([*_left(tsid=None), *_right(tsid=None)])
+
+    assert len(results) == 2
+    assert all(
+        atv.get_service(Protocol.RAOP).stereo_pair_address is None for atv in results
+    )
+
+
+@pytest.mark.asyncio
+async def test_scan_folds_pair_that_is_currently_split():
+    # A pair that is mid-session, or that a sender left split, shows both halves
+    # leading a group of their own (igl=1) with a gid of their own derived from
+    # the tsid. It is still one device and must still fold, which is why nothing
+    # but tsid is looked at.
+    results = await _scan_records(
+        [
+            *_speaker_records(
+                "OfficeLeft",
+                LEFT_ID,
+                LEFT_ADDRESS,
+                LEFT_PORT,
+                PAIR_TSID,
+                group={"igl": "1", "gcgl": "1", "gid": f"{PAIR_TSID}+0"},
+            ),
+            *_speaker_records(
+                "OfficeRight",
+                RIGHT_ID,
+                RIGHT_ADDRESS,
+                RIGHT_PORT,
+                PAIR_TSID,
+                group={"igl": "1", "gcgl": "1", "gid": f"{PAIR_TSID}+1"},
+            ),
+        ]
+    )
+
+    assert len(results) == 1
+    assert (
+        results[0].get_service(Protocol.RAOP).stereo_pair_address
+        == f"{RIGHT_ADDRESS}:{RIGHT_PORT}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_scan_for_one_half_returns_it_alone():
+    # Asking for a half by identifier must keep returning that half: it is what
+    # its own credentials are stored against
+    results = await _scan_records([*_left(), *_right()], identifier=RIGHT_ID)
+
+    assert len(results) == 1
+    assert results[0].identifier == RIGHT_ID
+    assert results[0].get_service(Protocol.RAOP).stereo_pair_address is None
+
+
+@pytest.mark.asyncio
+async def test_scan_for_pair_identifier_returns_the_pair():
+    # The identifier a pair is folded into is the only one scanning prints for it,
+    # so it is the one a user copies and passes back in (atvremote --id). It has to
+    # mean the pair, not the half it came from
+    results = await _scan_records([*_left(), *_right()], identifier=LEFT_ID)
+
+    assert len(results) == 1
+    assert results[0].identifier == LEFT_ID
+    assert (
+        results[0].get_service(Protocol.RAOP).stereo_pair_address
+        == f"{RIGHT_ADDRESS}:{RIGHT_PORT}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_scan_says_so_when_an_airplay_record_did_not_arrive(caplog):
+    # The measured failure: one half answered on RAOP inside the scan window and
+    # its AirPlay record did not. Only that record carries tsid, so there is
+    # nothing left to fold the pair on and both halves come back on their own -
+    # which is indistinguishable, to a caller, from two speakers that are not a
+    # pair. Streaming to either then plays half a stereo image.
+    with caplog.at_level(logging.WARNING, logger="pyatv.core.scan"):
+        results = await _scan_records([*_left(), *_right(airplay=False)])
+
+    assert len(results) == 2
+    assert all(
+        atv.get_service(Protocol.RAOP).stereo_pair_address is None for atv in results
+    )
+
+    # ...and the half is returned under its RAOP identifier rather than the
+    # AirPlay one an earlier scan printed
+    assert {atv.identifier for atv in results} == {LEFT_ID, RIGHT_RAOP_ID}
+
+    assert len(caplog.records) == 1
+    assert RIGHT_ADDRESS in caplog.text
+    assert RIGHT_RAOP_ID in caplog.text
+    assert "AirPlay record did not arrive" in caplog.text
+    # The remedy names the scanner that asks the host for the missing record. It does
+    # NOT say to scan again or to scan for longer: a speaker that has gone quiet on a
+    # type stays quiet for as long as a scan is willing to wait, so that advice sent
+    # callers round a loop that does not terminate.
+    assert "aiozc=None" in caplog.text
+    assert "longer timeout" not in caplog.text
+
+    # ...so asking for the identifier that was printed before finds nothing, and
+    # the warning is what says why. It is therefore said before that filter.
+    assert not await _scan_records(
+        [*_left(), *_right(airplay=False)], identifier=RIGHT_ID
+    )
+
+
+@pytest.mark.asyncio
+async def test_scan_says_nothing_about_a_speaker_with_no_airplay_record_to_miss(
+    caplog,
+):
+    # An AirPlay 1 speaker announces RAOP alone by design. The public key is what
+    # separates the two: AirPlay 2 repeats it from the record that is missing.
+    with caplog.at_level(logging.WARNING, logger="pyatv.core.scan"):
+        results = await _scan_records(
+            [*_left(), *_right(airplay=False, raop_properties=RAOP_AIRPLAY_1)]
+        )
+
+    assert len(results) == 2
+    assert not caplog.records
+
+
+@pytest.mark.asyncio
+async def test_scan_says_nothing_when_airplay_was_not_scanned_for(caplog):
+    # A scan that did not ask for AirPlay records did not miss any.
+    with caplog.at_level(logging.WARNING, logger="pyatv.core.scan"):
+        results = await _scan_records([*_left(), *_right()], protocol=Protocol.RAOP)
+
+    assert len(results) == 2
+    assert not caplog.records
+
+
+@pytest.mark.asyncio
+async def test_scan_does_not_fold_one_speaker_seen_at_two_addresses():
+    # A stale A record lives beside the new one for the rest of its TTL after DHCP
+    # moves a receiver, so for a while one speaker is two addresses with one
+    # identifier and one tsid. That is one device twice, not a pair: folding it
+    # would point a stream at two sessions on the same receiver, one of them
+    # through an address that may already be dead.
+    records = _left()
+    records.append(
+        DNSAddress(
+            "OfficeLeft.local.",
+            const._TYPE_A,
+            const._CLASS_IN,
+            const._DNS_HOST_TTL,
+            IPv4Address("192.168.107.55").packed,
+        )
+    )
+    results = await _scan_records(records)
+
+    assert len(results) == 2
+    assert all(atv.identifier == LEFT_ID for atv in results)
+    assert all(
+        atv.get_service(Protocol.RAOP).stereo_pair_address is None for atv in results
+    )
+
+
+def _multicast_response(identifier, tsid=None):
+    properties = {"deviceid": identifier}
+    if tsid:
+        properties["tsid"] = tsid
+    return Response(
+        services=[
+            Service(
+                "_airplay._tcp.local",
+                "OfficeLeft",
+                IPv4Address(LEFT_ADDRESS),
+                LEFT_PORT,
+                properties,
+            )
+        ],
+        deep_sleep=False,
+        model=None,
+    )
+
+
+@patch("pyatv.core.scan.get_unique_id", side_effect=lambda t, n, p: p.get("deviceid"))
+def test_multicast_scan_ends_early_on_a_plain_device(unique_id_mock):
+    scanner = MulticastMdnsScanner(None, LEFT_ID)  # loop is unused here
+
+    assert scanner._end_if_identifier_found(_multicast_response(LEFT_ID))
+    assert not scanner._end_if_identifier_found(_multicast_response(RIGHT_ID))
+
+
+@patch("pyatv.core.scan.get_unique_id", side_effect=lambda t, n, p: p.get("deviceid"))
+def test_multicast_scan_waits_out_a_stereo_pair(unique_id_mock):
+    # Ending the scan throws away every response but the matching one, so a half
+    # of a pair must not end it: the other half answers under its own identifier
+    # and there would be nothing left to fold the pair together from
+    scanner = MulticastMdnsScanner(None, LEFT_ID)  # loop is unused here
+
+    assert not scanner._end_if_identifier_found(
+        _multicast_response(LEFT_ID, tsid=PAIR_TSID)
+    )
