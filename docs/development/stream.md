@@ -245,6 +245,8 @@ A few things are worth knowing:
   beyond a stereo pair has been verified.
 * The halves stay a stereo pair while pyatv streams to them, and render their own
   left and right channels ([below](#the-pair-stays-a-pair)).
+* Credentials are per speaker: a pair whose halves have been paired with a PIN
+  needs *both* of them paired ([below](#a-pair-that-is-already-paired)).
 
 ### Pairing the halves up by hand
 
@@ -271,18 +273,51 @@ atvremote -s 10.0.0.10 --id <identifier> \
 This address is static: it is not discovered, so a device that gets a new address
 from DHCP silently breaks the setup. That is the price of overriding scanning.
 
-Neither the setting nor the automatic grouping works when credentials are stored
-for the device: both halves would be verified with the primary's pairing, which
-the other half has no record of. A buddy that scanning found is dropped in that
-case and only the device connected to is streamed to, while the setting, having
-been asked for explicitly, raises `NotSupportedError`.
+The setting cannot be used when credentials are stored for the device. Each half
+is then verified with the pairing made with *it*, and an address does not say
+which device answers at it, so there is nothing to look the other half's
+credentials up by: `NotSupportedError` is raised rather than failing
+mid-handshake. Unset it and let scanning group the pair, which carries the other
+half's identifier along with its address, or remove the credentials.
 
-This is worth knowing before pairing a stereo pair, because scanning cannot see
-it coming: credentials are read from storage after scanning has already folded
-the two halves together. So a pair with stored credentials is listed as one
-device, plays out of one speaker, and logs a warning saying so - the other half
-is neither in the scan results nor streamed to. Until per-half credentials exist,
-either leave the pair unpaired or expect one speaker.
+### A pair that is already paired
+
+A HomePod normally stores no credentials at all - it uses transient pairing - and
+that is why a pair usually just works. A half that *has* been paired with a PIN
+has credentials of its own, stored against its own identifier, and a pairing made
+with one half means nothing to the other.
+
+So **pair both halves and the pair groups**. Each half is verified with what is
+stored for *it*: the pairing made with that speaker when there is one, and what
+the device pyatv connects to uses when there is not. Pairing exactly one half
+therefore leaves one of two situations, depending on which half scanning kept -
+the lower identifier, which is nothing a user picks:
+
+* The *other* half is the paired one. It brings its own pairing along, and both
+  speakers play.
+* The half pyatv connects to is the paired one. That pairing means nothing to the
+  other half and there is nothing else to offer it, so that speaker is streamed to
+  on its own, exactly as it was before a pair became one configuration, and pyatv
+  logs a warning naming the half to pair:
+
+```shell
+atvremote --id <other half> --protocol raop pair
+```
+
+That half keeps its own identifier and is still found by a scan that asks for it,
+even though it no longer shows up on its own in `atvremote scan`. If the warning
+is not at hand, scanning just that speaker (`atvremote -s 10.0.0.20 scan`) prints
+it: one half alone is not a pair and is not folded.
+
+Which half is paired cannot be worked out while scanning - it has no storage, and
+folds the two halves together before any settings are loaded - so it is decided
+when the session is set up.
+
+A pairing that has been revoked or reset on one half is a different matter from
+one that was never made: credentials are still stored for that half, so it is
+still streamed to, and the receiver rejecting them fails the session for *both*
+speakers rather than for one. Pair that half again, or stream to the other one on
+its own with `--id <half>`.
 
 ### The pair stays a pair
 

@@ -168,6 +168,11 @@ class RaopSettings(BaseModel, extra="ignore"):  # type: ignore[call-arg]
     room, playing in sync from one timeline. Specify either just an address, e.g.
     "10.0.0.20", or an address and a port, e.g. "10.0.0.20:7000". The port used by
     this device is used when no port is specified.
+
+    Scanning finds a stereo pair on its own, so this is only needed for a pair it
+    did not recognize. It cannot be used when credentials are stored for the
+    device: an address does not say which device answers at it, and credentials
+    are stored per device, so the other half cannot be authenticated.
     """
 
 

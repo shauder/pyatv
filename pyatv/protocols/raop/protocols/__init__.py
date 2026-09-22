@@ -117,11 +117,30 @@ class StreamMember:
 class StreamProtocol(ABC):
     """Base interface for a streaming protocol."""
 
-    def __init__(self, context: StreamContext, rtsp: RtspSession) -> None:
-        """Initialize a new StreamProtocol instance."""
+    def __init__(
+        self,
+        context: StreamContext,
+        rtsp: RtspSession,
+        credentials: Optional[HapCredentials] = None,
+    ) -> None:
+        """Initialize a new StreamProtocol instance.
+
+        Credentials are the session's unless this receiver brought its own. The
+        other half of a stereo pair is a device in its own right: when it has been
+        paired, it is verified with the pairing made with *it* and not with the
+        one made with the device the session belongs to.
+        """
         self.context: StreamContext = context
         self.rtsp: RtspSession = rtsp
         self.member: StreamMember = StreamMember(rtsp)
+        self._credentials: Optional[HapCredentials] = credentials
+
+    @property
+    def credentials(self) -> HapCredentials:
+        """Return credentials this receiver is verified with."""
+        if self._credentials is None:
+            return self.context.credentials
+        return self._credentials
 
     @abstractmethod
     async def setup(self, timing_server_port: int, control_client_port: int) -> None:

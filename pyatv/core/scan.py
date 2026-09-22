@@ -151,7 +151,11 @@ def fold_stereo_pairs(configs: List[BaseConfig]) -> List[BaseConfig]:
         if not isinstance(service, MutableService) or buddy_service is None:
             continue
 
+        # The identifier travels with the address because it is the only thing the
+        # other half's own credentials can be looked up by, and whether there are
+        # any cannot be known here: scanning has no storage. Connecting does.
         service.pair_buddy_address = f"{buddy.address}:{buddy_service.port}"
+        service.pair_buddy_identifier = buddy_service.identifier
         folded_away.add(id(buddy))
         _LOGGER.debug(
             "Stereo pair %s: folded %s into %s", tsid, buddy.address, primary.address

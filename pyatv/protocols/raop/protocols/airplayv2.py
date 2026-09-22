@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from pyatv import exceptions
 from pyatv.auth.hap_channel import setup_channel
-from pyatv.auth.hap_pairing import PairVerifyProcedure
+from pyatv.auth.hap_pairing import HapCredentials, PairVerifyProcedure
 from pyatv.protocols.airplay.auth import verify_connection
 from pyatv.protocols.airplay.channels import EventChannel
 from pyatv.protocols.raop.protocols import StreamContext, StreamProtocol
@@ -75,9 +75,14 @@ def session_setup_body(
 class AirPlayV2(StreamProtocol):
     """Stream protocol used for AirPlay v1 support."""
 
-    def __init__(self, context: StreamContext, rtsp: RtspSession) -> None:
+    def __init__(
+        self,
+        context: StreamContext,
+        rtsp: RtspSession,
+        credentials: Optional[HapCredentials] = None,
+    ) -> None:
         """Initialize a new AirPlayV2 instance."""
-        super().__init__(context, rtsp)
+        super().__init__(context, rtsp, credentials)
         self.event_channel: Optional[asyncio.BaseTransport] = None
         self._verifier: Optional[PairVerifyProcedure] = None
         self._cipher: Optional[Chacha20Cipher] = None
@@ -86,9 +91,7 @@ class AirPlayV2(StreamProtocol):
         self.uuid = str(uuid4())
 
     async def _setup_base(self, timing_server_port: int) -> None:
-        self._verifier = await verify_connection(
-            self.context.credentials, self.rtsp.connection
-        )
+        self._verifier = await verify_connection(self.credentials, self.rtsp.connection)
 
         setup_resp = await self.rtsp.setup(
             body=session_setup_body(timing_server_port, self.context.group_uuid)

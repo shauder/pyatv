@@ -9,6 +9,7 @@ from typing import (
     Generator,
     List,
     Mapping,
+    NamedTuple,
     Optional,
     Set,
     Tuple,
@@ -18,7 +19,12 @@ from typing import (
 )
 
 from pyatv import const, exceptions
-from pyatv.auth.hap_pairing import NO_CREDENTIALS, TRANSIENT_CREDENTIALS
+from pyatv.auth.hap_pairing import (
+    NO_CREDENTIALS,
+    TRANSIENT_CREDENTIALS,
+    HapCredentials,
+    parse_credentials,
+)
 from pyatv.const import (
     DeviceModel,
     FeatureName,
@@ -55,6 +61,7 @@ from pyatv.interface import (
     Playing,
     PushUpdater,
     RemoteControl,
+    Storage,
     Stream,
 )
 from pyatv.protocols.airplay.auth import extract_credentials
@@ -131,48 +138,87 @@ def _parse_buddy_address(address: str, default_port: int) -> Tuple[str, int]:
     return host.strip(), int(port) if port else default_port
 
 
-def buddy_address(service: BaseService, settings: RaopSettings) -> Optional[str]:
-    """Return address of the other half of a stereo pair, if there is one.
+class PairBuddy(NamedTuple):
+    """The other half of a stereo pair: where it is and what it is verified with."""
+
+    address: str
+    port: int
+    credentials: HapCredentials
+
+
+def _stored_raop_credentials(storage: Storage, identifier: str) -> Optional[str]:
+    """Return RAOP credentials stored for a device other than the one connected to.
+
+    Searched by identifier rather than through `get_settings`, which needs a
+    configuration the folded-away half no longer has and would create an empty
+    record for a device that has none.
+    """
+    for settings in storage.settings:
+        if settings.protocols.raop.identifier == identifier:
+            return settings.protocols.raop.credentials
+    return None
+
+
+def pair_buddy(
+    service: BaseService, settings: RaopSettings, storage: Storage
+) -> Optional[PairBuddy]:
+    """Return the other half of a stereo pair to stream to, if there is one.
 
     Scanning fills in the buddy for a pair it recognized, but a configured
     pair_buddy_address always wins: it is the escape hatch for anything scanning
     got wrong, including a pair it should not have folded together.
+
+    Credentials are per device and scanning cannot see them: it has no storage, and
+    folds the halves together before any settings are loaded. So the decision is made
+    here, where storage is at hand. A half that cannot be verified with anything -
+    this device paired, the other one not - is left out and this device streamed to
+    alone.
     """
     configured = settings.pair_buddy_address
-    discovered = (
-        service.pair_buddy_address if isinstance(service, MutableService) else None
+    discovered, identifier = (
+        (service.pair_buddy_address, service.pair_buddy_identifier)
+        if isinstance(service, MutableService)
+        else (None, None)
     )
     address = configured or discovered
     if address is None:
         return None
 
-    # Credentials live on the shared StreamContext, so both halves would
-    # authenticate with the primary's HAP long-term keys. That works for transient
-    # pairing, which carries no per-device state, but stored credentials are bound
-    # to the primary's pairing record and the buddy has no such pairing: it would
-    # reject the verify. There is nowhere to put the buddy's own credentials yet
-    # (pair_buddy_address is a bare address).
-    if extract_credentials(service) in (NO_CREDENTIALS, TRANSIENT_CREDENTIALS):
-        return address
+    host, port = _parse_buddy_address(address, service.port)
+    credentials = extract_credentials(service)
+
+    # Which half the fold kept is arbitrary (lower identifier), so the other half's
+    # own pairing is what counts, whatever this device uses. Only scanning knows which
+    # device answers at an address, so a hand-configured one is not looked up.
+    buddy_credentials = (
+        _stored_raop_credentials(storage, identifier)
+        if identifier and not configured
+        else None
+    )
+    if buddy_credentials:
+        return PairBuddy(host, port, parse_credentials(buddy_credentials))
+
+    # Nothing is bound to this device either: transient pairing carries no per-device
+    # state and an unpaired receiver demands nothing. Both halves are then driven with
+    # what this device uses, which is the normal case for a pair of HomePods.
+    if credentials in (NO_CREDENTIALS, TRANSIENT_CREDENTIALS):
+        return PairBuddy(host, port, credentials)
 
     if configured:
-        # Asked for explicitly, so say why it cannot be done instead of failing
-        # mid-handshake
         raise exceptions.NotSupportedError(
-            "pair_buddy_address cannot be used with stored credentials: "
-            "the buddy would be verified with the primary's pairing"
+            "pair_buddy_address cannot be used with stored credentials: an address "
+            "does not say which device it is, and credentials are stored per device. "
+            "Unset it and let scanning group the pair, or remove the credentials"
         )
 
-    # Nobody asked for this half, scanning offered it. Streaming to the device
-    # that was connected to is better than refusing to stream at all - but say so
-    # loudly rather than at debug level: scanning has already folded this half
-    # away, so from the outside a stereo pair has just quietly become one speaker.
+    # Only one half is paired: stream to it rather than refusing, which is what
+    # happened before the fold, but say so and say what makes both play.
     _LOGGER.warning(
-        "Not streaming to stereo pair half %s: stored credentials for %s are bound "
-        "to that device only and per-half credentials are not supported, so only "
-        "one speaker will play. Remove the stored credentials to use the pair",
-        discovered,
+        "Streaming to %s only: the other half of the stereo pair (%s) has no stored "
+        "credentials of its own, and this device's cannot be used for it. Pair that "
+        "half as well to stream to both speakers",
         service.identifier,
+        identifier or discovered,
     )
     return None
 
@@ -222,6 +268,9 @@ class RaopPlaybackManager:
             else airplayv2.AirPlayV2
         )
 
+        # What the session authenticates with unless a receiver brings its own
+        self._context.credentials = extract_credentials(service)
+
         protocols = [
             await self._connect(
                 str(self.core.config.address), self.core.service.port, protocol_class
@@ -230,11 +279,18 @@ class RaopPlaybackManager:
 
         # A stereo pair is streamed to as two receivers playing from one timeline,
         # so connect to the other half as well when there is one
-        buddy = buddy_address(self.core.service, self.core.settings.protocols.raop)
+        buddy = pair_buddy(
+            self.core.service, self.core.settings.protocols.raop, self.core.storage
+        )
         if buddy:
-            address, port = _parse_buddy_address(buddy, self.core.service.port)
-            _LOGGER.debug("Streaming to stereo pair buddy at %s:%d", address, port)
-            protocols.append(await self._connect(address, port, protocol_class))
+            _LOGGER.debug(
+                "Streaming to stereo pair buddy at %s:%d", buddy.address, buddy.port
+            )
+            protocols.append(
+                await self._connect(
+                    buddy.address, buddy.port, protocol_class, buddy.credentials
+                )
+            )
 
         # The SSRC identifies the audio stream and is shared by everyone receiving it
         self._context.ssrc = protocols[0].rtsp.session_id
@@ -250,12 +306,20 @@ class RaopPlaybackManager:
         return self._stream_client, self._context
 
     async def _connect(
-        self, address: str, port: int, protocol_class: Type[StreamProtocol]
+        self,
+        address: str,
+        port: int,
+        protocol_class: Type[StreamProtocol],
+        credentials: Optional[HapCredentials] = None,
     ) -> StreamProtocol:
-        """Connect to one receiver and return a protocol instance for it."""
+        """Connect to one receiver and return a protocol instance for it.
+
+        Credentials are the session's (i.e. the device connected to) unless this
+        receiver brought its own, which the other half of a paired stereo pair does.
+        """
         connection = await http_connect(address, port)
         self._connections.append(connection)
-        return protocol_class(self._context, RtspSession(connection))
+        return protocol_class(self._context, RtspSession(connection), credentials)
 
     async def teardown(self) -> None:
         """Tear down and disconnect current session."""
@@ -443,7 +507,6 @@ class RaopStream(Stream):
         )
         try:
             client, context = await self.playback_manager.setup(self.core.service)
-            context.credentials = extract_credentials(self.core.service)
             context.password = self.core.service.password
 
             client.listener = self.listener

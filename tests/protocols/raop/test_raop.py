@@ -8,15 +8,21 @@ from deepdiff import DeepDiff
 import pytest
 
 from pyatv import exceptions
+from pyatv.auth.hap_pairing import NO_CREDENTIALS, parse_credentials
+from pyatv.conf import AppleTV, ManualService
 from pyatv.const import DeviceModel, OperatingSystem, PairingRequirement, Protocol
 from pyatv.core import MutableService, mdns
 from pyatv.interface import DeviceInfo
-from pyatv.protocols.raop import buddy_address, device_info, scan, service_info
+from pyatv.protocols.raop import device_info, pair_buddy, scan, service_info
 from pyatv.protocols.raop.protocols import StreamContext, StreamMember
 from pyatv.protocols.raop.stream_client import ControlClient
 from pyatv.settings import RaopSettings
+from pyatv.storage.memory_storage import MemoryStorage
 
 from tests.fake_device.airplay import DEVICE_CREDENTIALS as CREDENTIALS
+
+# Credentials of the other half: a device of its own, paired on its own
+BUDDY_CREDENTIALS = "aabbccdd:00112233445566778899aabbccddeeff"
 
 RAOP_SERVICE = "_raop._tcp.local"
 AIRPORT_SERVICE = "_airport._tcp.local"
@@ -225,49 +231,145 @@ def test_retransmit_attribution_tells_loopback_members_apart():
 
 
 # Stereo pair buddy: scanning fills it in on the service, a user can override it
-# in the settings
+# in the settings, and what each half is verified with is decided here because
+# only here are the stored credentials of both halves available
 
 
-def _raop_service(credentials=None, buddy=None) -> MutableService:
+def _raop_service(credentials=None, buddy=None, buddy_id=None) -> MutableService:
     service = MutableService("id", Protocol.RAOP, 7000, {}, credentials=credentials)
     service.pair_buddy_address = buddy
+    service.pair_buddy_identifier = buddy_id
     return service
 
 
-def test_buddy_address_without_pair():
-    assert buddy_address(_raop_service(), RaopSettings()) is None
+async def _storage(paired=None, credentials=None) -> MemoryStorage:
+    """Storage as pairing a device leaves it: settings under its own identifier."""
+    storage = MemoryStorage()
+    if paired:
+        config = AppleTV("10.0.0.20", "Other half")
+        config.add_service(ManualService(paired, Protocol.RAOP, 7000, {}))
+        settings = await storage.get_settings(config)
+        settings.protocols.raop.credentials = credentials
+    return storage
 
 
-def test_buddy_address_from_scan():
-    service = _raop_service(buddy="10.0.0.20:7000")
+@pytest.mark.asyncio
+async def test_buddy_without_pair():
+    assert pair_buddy(_raop_service(), RaopSettings(), await _storage()) is None
 
-    assert buddy_address(service, RaopSettings()) == "10.0.0.20:7000"
+
+@pytest.mark.asyncio
+async def test_buddy_from_scan():
+    service = _raop_service(buddy="10.0.0.20:7000", buddy_id="buddy_id")
+
+    buddy = pair_buddy(service, RaopSettings(), await _storage())
+
+    # No credentials are stored for this device, so nothing is bound to it and the
+    # other half is driven with the same (lack of) credentials
+    assert buddy == ("10.0.0.20", 7000, NO_CREDENTIALS)
 
 
-def test_configured_buddy_address_wins():
+@pytest.mark.asyncio
+async def test_buddy_port_defaults_to_the_port_of_this_device():
+    service = _raop_service(buddy="10.0.0.20", buddy_id="buddy_id")
+
+    buddy = pair_buddy(service, RaopSettings(), await _storage())
+
+    assert buddy == ("10.0.0.20", 7000, NO_CREDENTIALS)
+
+
+@pytest.mark.asyncio
+async def test_configured_buddy_address_wins():
     # The setting is the escape hatch for anything scanning got wrong, so it wins
     # even when scanning found a buddy of its own
-    service = _raop_service(buddy="10.0.0.20:7000")
+    service = _raop_service(buddy="10.0.0.20:7000", buddy_id="buddy_id")
     settings = RaopSettings(pair_buddy_address="10.0.0.30")
 
-    assert buddy_address(service, settings) == "10.0.0.30"
+    buddy = pair_buddy(service, settings, await _storage())
+
+    assert buddy.address == "10.0.0.30"
 
 
-def test_configured_buddy_address_rejected_with_stored_credentials():
-    settings = RaopSettings(pair_buddy_address="10.0.0.30")
+@pytest.mark.asyncio
+async def test_paired_buddy_is_verified_with_its_own_credentials():
+    # Both halves paired: each connection is verified with the pairing made with
+    # that speaker, which is what makes a paired pair play as a pair
+    service = _raop_service(
+        credentials=CREDENTIALS, buddy="10.0.0.20:7000", buddy_id="buddy_id"
+    )
+    storage = await _storage("buddy_id", BUDDY_CREDENTIALS)
 
-    with pytest.raises(exceptions.NotSupportedError):
-        buddy_address(_raop_service(credentials=CREDENTIALS), settings)
+    buddy = pair_buddy(service, RaopSettings(), storage)
+
+    assert buddy == ("10.0.0.20", 7000, parse_credentials(BUDDY_CREDENTIALS))
 
 
-def test_discovered_buddy_address_dropped_with_stored_credentials(caplog):
-    # Nobody asked for this buddy, so streaming to the device that was connected
-    # to beats refusing to stream at all. It is warned about rather than silently
-    # dropped: scanning has already folded that half away, so a pair has become
-    # one speaker with nothing else to show for it
-    service = _raop_service(credentials=CREDENTIALS, buddy="10.0.0.20:7000")
+@pytest.mark.asyncio
+async def test_paired_buddy_brings_its_own_to_an_unpaired_device():
+    # Only the half that folding put away is paired. Which half that is was decided
+    # by the lower identifier, not by the user, so this has to come out the same as
+    # the other way around: the paired half is verified with its own pairing, and
+    # this device with what it has (here: nothing)
+    service = _raop_service(buddy="10.0.0.20:7000", buddy_id="buddy_id")
+    storage = await _storage("buddy_id", BUDDY_CREDENTIALS)
+
+    buddy = pair_buddy(service, RaopSettings(), storage)
+
+    assert buddy == ("10.0.0.20", 7000, parse_credentials(BUDDY_CREDENTIALS))
+
+
+@pytest.mark.asyncio
+async def test_unpaired_buddy_leaves_this_device_streaming_alone(caplog):
+    # Only this half is paired, so the other half has nothing to be verified with:
+    # this device is streamed to on its own, as it was before a pair became one
+    # configuration. The log is the only sign of it, so it is part of the feature:
+    # it names the half to pair to get both speakers playing
+    service = _raop_service(
+        credentials=CREDENTIALS, buddy="10.0.0.20:7000", buddy_id="buddy_id"
+    )
 
     with caplog.at_level(logging.WARNING, logger="pyatv.protocols.raop"):
-        assert buddy_address(service, RaopSettings()) is None
+        assert pair_buddy(service, RaopSettings(), await _storage()) is None
 
-    assert "10.0.0.20:7000" in caplog.text
+    assert len(caplog.records) == 1
+    assert "buddy_id" in caplog.text
+    assert "Pair that half" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_buddy_without_identifier_cannot_be_looked_up(caplog):
+    # A buddy from a configuration made before identifiers were carried, or one
+    # whose half advertised none: there is nothing to look credentials up by
+    service = _raop_service(credentials=CREDENTIALS, buddy="10.0.0.20:7000")
+    storage = await _storage("buddy_id", BUDDY_CREDENTIALS)
+
+    with caplog.at_level(logging.WARNING, logger="pyatv.protocols.raop"):
+        assert pair_buddy(service, RaopSettings(), storage) is None
+
+    assert len(caplog.records) == 1
+
+
+@pytest.mark.asyncio
+async def test_configured_buddy_address_is_not_the_buddy_scanning_found():
+    # The setting names a place and overrides the address scanning worked out, so
+    # the identifier that came with that address no longer says which device answers
+    # there: nothing is looked up for it, and the other half gets what this device
+    # uses, as it did before any of them were paired
+    service = _raop_service(buddy="10.0.0.20:7000", buddy_id="buddy_id")
+    settings = RaopSettings(pair_buddy_address="10.0.0.30")
+    storage = await _storage("buddy_id", BUDDY_CREDENTIALS)
+
+    buddy = pair_buddy(service, settings, storage)
+
+    assert buddy == ("10.0.0.30", 7000, NO_CREDENTIALS)
+
+
+@pytest.mark.asyncio
+async def test_configured_buddy_address_rejected_with_stored_credentials():
+    # An address does not say which device answers at it, so the credentials of
+    # the half named by hand cannot be found even when they are stored
+    settings = RaopSettings(pair_buddy_address="10.0.0.20")
+    storage = await _storage("buddy_id", BUDDY_CREDENTIALS)
+
+    with pytest.raises(exceptions.NotSupportedError):
+        pair_buddy(_raop_service(credentials=CREDENTIALS), settings, storage)

@@ -260,6 +260,7 @@ def _create_mrp_tunnel_data(core: Core, credentials: HapCredentials):
             core.session_manager,
             core.takeover,
             core.state_dispatcher.create_copy(Protocol.MRP),
+            core.storage,
         ),
         AirPlayMrpConnection(session, core.device_listener),
         requires_heatbeat=False,  # Already have heartbeat on control channel
@@ -367,6 +368,7 @@ def setup(  # pylint: disable=too-many-locals
             core.session_manager,
             core.takeover,
             core.state_dispatcher.create_copy(Protocol.RAOP),
+            core.storage,
         )
 
         yield from raop_setup(raop_core)

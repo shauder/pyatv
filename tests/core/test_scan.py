@@ -534,6 +534,22 @@ async def test_scan_folds_stereo_pair_into_one_config():
 
 
 @pytest.mark.asyncio
+async def test_scan_carries_the_other_half_identifier():
+    # Whether the other half has credentials of its own cannot be known here:
+    # scanning has no storage. Its identifier is carried along with its address so
+    # that connecting, which does have storage, can look them up.
+    results = await _scan_records([*_left(), *_right()])
+
+    assert results[0].get_service(Protocol.RAOP).pair_buddy_identifier == RIGHT_ID
+
+    # ...and that is the identifier the half answers to on its own, i.e. the one
+    # pairing it stores its credentials against
+    alone = await _scan_records([*_left(), *_right()], identifier=RIGHT_ID)
+
+    assert alone[0].get_service(Protocol.RAOP).identifier == RIGHT_ID
+
+
+@pytest.mark.asyncio
 async def test_scan_does_not_fold_half_without_partner():
     results = await _scan_records(_left())
 

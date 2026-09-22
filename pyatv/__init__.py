@@ -166,6 +166,7 @@ async def connect(  # pylint: disable=too-many-locals
                 core_dispatcher=core_dispatcher,
                 takeover_method=takeover_method,
                 loop=loop,
+                storage=storage,
             )
 
             for setup_data in proto_methods.setup(core):
@@ -206,6 +207,7 @@ async def pair(
         settings=settings,
         session_manager=session_manager,
         loop=loop,
+        storage=storage,
     )
 
     try:
