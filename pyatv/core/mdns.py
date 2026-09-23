@@ -79,10 +79,14 @@ def _decode_properties(
 def create_service_queries(
     services: typing.List[str], qtype: QueryType
 ) -> typing.List[bytes]:
-    """Create service request messages."""
+    """Create service request messages.
+
+    Services are split into consecutive chunks of at most SERVICES_PER_MSG that do
+    not overlap. A question for SLEEP_PROXY_SERVICE is appended to every message.
+    """
     queries: typing.List[bytes] = []
     for i in range(math.ceil(len(services) / SERVICES_PER_MSG)):
-        service_chunk = services[i * SERVICES_PER_MSG : i * SERVICES_PER_MSG + 4]
+        service_chunk = services[i * SERVICES_PER_MSG : (i + 1) * SERVICES_PER_MSG]
 
         msg = DnsMessage(0x35FF)
         msg.questions += [DnsQuestion(s, qtype, 0x8001) for s in service_chunk]

@@ -42,6 +42,22 @@ def parse_services(message: mdns.DnsMessage) -> List[mdns.Service]:
     return parser.parse()
 
 
+def test_service_queries_do_not_repeat_a_service():
+    """Each service is asked for once, in consecutive chunks of three."""
+    services = [f"_service{i}._tcp.local" for i in range(10)]
+
+    messages = [
+        [
+            question.qname
+            for question in dns.DnsMessage().unpack(query).questions
+            if question.qname != mdns.SLEEP_PROXY_SERVICE
+        ]
+        for query in mdns.create_service_queries(services, mdns.QueryType.PTR)
+    ]
+
+    assert messages == [services[0:3], services[3:6], services[6:9], services[9:]]
+
+
 def test_non_existing_service():
     resp, _ = get_response_for_service("_missing")
     assert len(resp.questions) == 2
